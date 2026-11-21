@@ -437,6 +437,12 @@ impl Fake {
             .collect()
     }
 
+    /// The windows the helper owns, as the window server lists them (no permission is needed for
+    /// who owns a window and whether it is on screen).
+    pub fn windows(&self) -> Vec<WindowFact> {
+        windows_of(self.pid)
+    }
+
     /// The helper's own child processes with their whole command lines.
     pub fn children(&self) -> Vec<(u32, String)> {
         let out = std::process::Command::new("ps")
@@ -565,4 +571,64 @@ pub fn profile(context: &str, dir: Option<&str>) -> Profile {
 /// An RGB the page shows, as the BGRA a frame holds.
 pub fn bgra(r: u8, g: u8, b: u8) -> [u8; 4] {
     [b, g, r, 255]
+}
+
+/// One window of a process: its layer (0 is an ordinary window) and whether it is on screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowFact {
+    pub layer: i32,
+    pub on_screen: bool,
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGWindowListCopyWindowInfo(option: u32, relative_to: u32) -> *const std::ffi::c_void;
+    static kCGWindowOwnerPID: *const std::ffi::c_void;
+    static kCGWindowLayer: *const std::ffi::c_void;
+    static kCGWindowIsOnscreen: *const std::ffi::c_void;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFArrayGetCount(array: *const std::ffi::c_void) -> isize;
+    fn CFArrayGetValueAtIndex(array: *const std::ffi::c_void, at: isize)
+    -> *const std::ffi::c_void;
+    fn CFDictionaryGetValue(
+        dict: *const std::ffi::c_void,
+        key: *const std::ffi::c_void,
+    ) -> *const std::ffi::c_void;
+    fn CFNumberGetValue(number: *const std::ffi::c_void, kind: i32, out: *mut i32) -> bool;
+    fn CFBooleanGetValue(boolean: *const std::ffi::c_void) -> bool;
+    fn CFRelease(object: *const std::ffi::c_void);
+}
+
+fn windows_of(pid: u32) -> Vec<WindowFact> {
+    const ALL_WINDOWS: u32 = 0;
+    const NO_WINDOW: u32 = 0;
+    const SINT32: i32 = 3;
+    let mut found = Vec::new();
+    unsafe {
+        let list = CGWindowListCopyWindowInfo(ALL_WINDOWS, NO_WINDOW);
+        if list.is_null() {
+            return found;
+        }
+        for at in 0..CFArrayGetCount(list) {
+            let entry = CFArrayGetValueAtIndex(list, at);
+            let number = |key: *const std::ffi::c_void| {
+                let value = CFDictionaryGetValue(entry, key);
+                let mut out = 0i32;
+                (!value.is_null() && CFNumberGetValue(value, SINT32, &mut out)).then_some(out)
+            };
+            if number(kCGWindowOwnerPID) != Some(pid as i32) {
+                continue;
+            }
+            let shown = CFDictionaryGetValue(entry, kCGWindowIsOnscreen);
+            found.push(WindowFact {
+                layer: number(kCGWindowLayer).unwrap_or(0),
+                on_screen: !shown.is_null() && CFBooleanGetValue(shown),
+            });
+        }
+        CFRelease(list);
+    }
+    found
 }

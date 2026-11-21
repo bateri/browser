@@ -9,6 +9,7 @@ mod commands;
 mod config;
 mod convert;
 mod handlers;
+mod keys;
 mod mac;
 mod rules;
 mod state;
@@ -26,6 +27,11 @@ use std::time::{Duration, Instant};
 /// The most the loop sleeps without hearing from the engine: it asks for its work to be done
 /// through `on_schedule_message_pump_work`, and this is only the net under that.
 const HEARTBEAT: Duration = Duration::from_millis(100);
+/// How often the loop turns while a window of the helper's own is open.
+const WINDOW_TURN: Duration = Duration::from_millis(8);
+/// How long after the last window was seen on screen the loop keeps turning that often: taking a
+/// window away is also done through the event queue.
+const WINDOW_GRACE: Duration = Duration::from_millis(500);
 /// How long the end waits for browsers to close and cookies to be written.
 const SHUTDOWN_LIMIT: Duration = Duration::from_secs(8);
 
@@ -73,9 +79,13 @@ wrap_app! {
                 Some(&"force-webrtc-ip-handling-policy".into()),
                 Some(&"disable_non_proxied_udp".into()),
             );
+            // Also off: the macOS notification bridge. It starts a helper of its own that registers
+            // the app with the system's notification center, which makes the system ask the person
+            // whether "bateri Browser" may send notifications; the helper never shows any (a
+            // page's request is refused), so it must not appear there at all.
             cl.append_switch_with_value(
                 Some(&"disable-features".into()),
-                Some(&"OptimizationHints,OptimizationGuideModelDownloading,Translate,MediaRouter,CertificateTransparencyComponentUpdater,AutofillServerCommunication,SafeBrowsing".into()),
+                Some(&"OptimizationHints,OptimizationGuideModelDownloading,Translate,MediaRouter,CertificateTransparencyComponentUpdater,AutofillServerCommunication,SafeBrowsing,NativeNotifications".into()),
             );
         }
 
@@ -273,12 +283,26 @@ fn main() {
 
 /// The main loop: sleeps until a command, the engine, or a dropped frame's turn comes.
 fn run(rx: &mpsc::Receiver<Msg>) {
+    let mut window_until: Option<Instant> = None;
     loop {
         if state::quitting() {
             return;
         }
         let now = Instant::now();
         let mut next = now + HEARTBEAT;
+        // A window of the helper's own (the developer tools') wants the loop to turn often enough
+        // to be drawn and typed into.
+        if mac::has_windows() {
+            if window_until.is_none() {
+                trace!("a window of the helper's own is on screen");
+            }
+            window_until = Some(now + WINDOW_GRACE);
+        }
+        if window_until.is_some_and(|until| until > now) {
+            next = now + WINDOW_TURN;
+        } else if window_until.take().is_some() {
+            trace!("the window of the helper's own is gone");
+        }
         if let Some(at) = state::peek_pump_deadline() {
             next = next.min(at);
         }
@@ -302,6 +326,7 @@ fn run(rx: &mpsc::Receiver<Msg>) {
         }
         state::take_pump_deadline();
         do_message_loop_work();
+        mac::pump_events();
         commands::tick();
         if hangup {
             return;

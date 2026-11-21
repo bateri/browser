@@ -9,9 +9,9 @@ use crate::handlers::{HelperClient, observe, push_state};
 use crate::state::{
     self, Context, Creds, Entry, FindStart, browser_of, emit, emit_error, with, with_entry,
 };
-use crate::{agent, rules, trace};
+use crate::{agent, keys, rules, trace};
 use browser_ipc::Command;
-use browser_ipc::message::{Button, Event, MouseKind, Profile};
+use browser_ipc::message::{Button, EditAction, Event, KeyKind, MouseKind, Profile};
 use cef::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,6 +19,9 @@ use std::time::Instant;
 
 /// Commands kept for a browser the engine has not finished creating.
 const QUEUE_LIMIT: usize = 256;
+
+/// How long after the developer tools are asked for their window is brought to the front.
+const DEVTOOLS_FRONT: std::time::Duration = std::time::Duration::from_secs(3);
 
 pub fn handle(command: Command) {
     match command {
@@ -519,8 +522,45 @@ fn apply(id: u32, browser: &Browser, command: Command) {
             };
             host.send_mouse_wheel_event(Some(&event), dx, dy);
         }
-        Command::Key { kind, key, .. } => {
-            host.send_key_event(Some(&key_event_of(kind, &key)));
+        // A key with editing commands goes through the protocol, which can carry them to the page
+        // (the engine's own key call cannot); the page's default for the key is then the commands,
+        // and a key nobody uses still comes back as `UnhandledKey`. Everything else, and a key
+        // whose commands were all dropped, is the engine's plain key event: both paths reach the
+        // page in the order they were sent (a test sends hundreds of mixed keys back to back).
+        Command::Key {
+            kind,
+            key,
+            commands,
+            ..
+        } => {
+            let commands = if kind == KeyKind::Down {
+                keys::clean_commands(&commands)
+            } else {
+                vec![]
+            };
+            let sent = !commands.is_empty()
+                && agent::fire(
+                    id,
+                    "Input.dispatchKeyEvent",
+                    keys::dispatch_key_down(&key, &commands),
+                );
+            if !sent {
+                host.send_key_event(Some(&key_event_of(kind, &key)));
+            }
+        }
+        // The Edit menu: the frame that has the focus runs the command on what it has selected, and
+        // copy, cut and paste use the system's pasteboard.
+        Command::Edit { action, .. } => {
+            if let Some(frame) = browser.focused_frame().or_else(|| browser.main_frame()) {
+                match action {
+                    EditAction::Copy => frame.copy(),
+                    EditAction::Cut => frame.cut(),
+                    EditAction::Paste => frame.paste(),
+                    EditAction::Undo => frame.undo(),
+                    EditAction::Redo => frame.redo(),
+                    EditAction::SelectAll => frame.select_all(),
+                }
+            }
         }
         // Text the way the system's input method hands it over: committed as a whole, never as key
         // events (a Turkish letter has no key of its own), and composition while it is marked.
@@ -596,6 +636,9 @@ fn apply(id: u32, browser: &Browser, command: Command) {
                     Some(&BrowserSettings::default()),
                     None,
                 );
+                with_entry(id, |e| {
+                    e.devtools_front = Some(Instant::now() + DEVTOOLS_FRONT)
+                });
             } else {
                 host.close_dev_tools();
             }
@@ -613,6 +656,23 @@ pub fn next_repaint() -> Option<Instant> {
 /// Asks for the frames that were dropped while bateri was behind.
 pub fn tick() {
     let now = Instant::now();
+    let fronting = with(|s| {
+        let mut any = false;
+        for e in s.entries.values_mut() {
+            if let Some(until) = e.devtools_front {
+                if until <= now {
+                    e.devtools_front = None;
+                } else {
+                    any = true;
+                }
+            }
+        }
+        any
+    });
+    // The window exists only after the engine has made it, a turn or two after the command.
+    if fronting && crate::mac::show_windows() {
+        with(|s| s.entries.values_mut().for_each(|e| e.devtools_front = None));
+    }
     let due: Vec<u32> = with(|s| {
         s.entries
             .values_mut()

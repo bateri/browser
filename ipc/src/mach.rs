@@ -11,7 +11,9 @@ use std::mem::size_of;
 
 use mach2::bootstrap::{bootstrap_check_in, bootstrap_look_up, bootstrap_port, bootstrap_register};
 use mach2::kern_return::KERN_SUCCESS;
-use mach2::mach_port::{mach_port_allocate, mach_port_deallocate, mach_port_insert_right};
+use mach2::mach_port::{
+    mach_port_allocate, mach_port_deallocate, mach_port_insert_right, mach_port_mod_refs,
+};
 use mach2::message::*;
 use mach2::port::{MACH_PORT_NULL, MACH_PORT_RIGHT_RECEIVE, mach_port_t};
 use mach2::traps::mach_task_self;
@@ -141,9 +143,24 @@ fn check(what: &str, code: i32) -> io::Result<()> {
     }
 }
 
-/// bateri's end: owns the receive right.
+/// Gives up the receive right of `port`: the port dies, senders get a dead name, and the name is
+/// free again. Nothing else may hold a right under `port` in this task.
+fn destroy(port: mach_port_t) {
+    unsafe {
+        mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_RECEIVE, -1);
+    }
+}
+
+/// bateri's end: owns the receive right, and gives it up when dropped (a helper started later
+/// makes a new one under a new name; the old right would otherwise stay until bateri quits).
 pub struct Receiver {
     port: mach_port_t,
+}
+
+impl Drop for Receiver {
+    fn drop(&mut self) {
+        destroy(self.port);
+    }
 }
 
 impl Receiver {
@@ -165,7 +182,11 @@ impl Receiver {
                 mach_port_insert_right(mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND),
             )?;
             let registered = bootstrap_register(bootstrap_port, cname.as_ptr() as *mut _, port);
+            // The send right was only there to register with: the bootstrap server holds its own
+            // now, and keeping ours would leave a name behind after the receive right is gone.
+            mach_port_deallocate(mach_task_self(), port);
             if registered != KERN_SUCCESS {
+                destroy(port);
                 return Err(io::Error::other(format!(
                     "bootstrap_check_in: {check_in}; bootstrap_register: {registered}"
                 )));
@@ -215,6 +236,14 @@ pub enum Sent {
 /// The helper's end.
 pub struct Sender {
     port: mach_port_t,
+}
+
+impl Drop for Sender {
+    fn drop(&mut self) {
+        unsafe {
+            mach_port_deallocate(mach_task_self(), self.port);
+        }
+    }
 }
 
 impl Sender {
@@ -270,5 +299,53 @@ impl Sender {
                 Err(io::Error::other(format!("mach_msg send: {code:#x}")))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe extern "C" {
+        fn mach_port_type(task: mach_port_t, name: mach_port_t, port_type: *mut u32) -> i32;
+    }
+
+    /// Whether this task still has a right under `name`.
+    fn has_name(name: mach_port_t) -> bool {
+        let mut kind = 0u32;
+        unsafe { mach_port_type(mach_task_self(), name, &mut kind) == KERN_SUCCESS }
+    }
+
+    #[test]
+    fn a_dropped_receiver_gives_its_port_up() {
+        let name = format!("{NAME_PREFIX}.test-{}", std::process::id());
+        let receiver = Receiver::register(&name).unwrap();
+        let port = receiver.port;
+        assert!(has_name(port), "the receive right is there while it lives");
+        // A sender in this very process gets a name for the same port (a task has one name per
+        // port); its right goes when it is dropped, or the name would outlive the receiver as a
+        // dead name.
+        let sender = Sender::lookup(&name).unwrap();
+        assert_eq!(sender.port, port);
+        drop(sender);
+        assert!(has_name(port), "the receive right outlives the sender");
+        drop(receiver);
+        assert!(
+            !has_name(port),
+            "no right is left under the receiver's name"
+        );
+    }
+
+    #[test]
+    fn a_receiver_per_name_leaves_nothing_behind() {
+        // What a long-running bateri does: one receiver per helper it starts.
+        let mut names = Vec::new();
+        for n in 0..50 {
+            let name = format!("{NAME_PREFIX}.test-{}-{n}", std::process::id());
+            let receiver = Receiver::register(&name).unwrap();
+            names.push(receiver.port);
+        }
+        // Every receiver was dropped at the end of its turn; none of the names is still ours.
+        assert!(names.iter().all(|&p| !has_name(p)));
     }
 }

@@ -85,6 +85,11 @@ fn commands() -> Vec<Command> {
             browser: 1,
             kind: KeyKind::Down,
             key: key(),
+            commands: vec![],
+        },
+        Command::Edit {
+            browser: 1,
+            action: EditAction::SelectAll,
         },
         Command::ImeCommit {
             browser: 1,
@@ -321,7 +326,16 @@ fn every_command_has_its_fixture() {
     for c in &all {
         check("to-helper", c.name(), c);
     }
+    // A shape of a message that has an optional part has a fixture of its own besides the plain one.
+    let with_commands = Command::Key {
+        browser: 1,
+        kind: KeyKind::Down,
+        key: key(),
+        commands: vec!["moveToBeginningOfLine".into(), "selectAll".into()],
+    };
+    check("to-helper", "key_commands", &with_commands);
     let mut want: Vec<String> = all.iter().map(|c| c.name().to_string()).collect();
+    want.push("key_commands".into());
     want.sort();
     assert_eq!(
         files("to-helper"),
@@ -470,6 +484,15 @@ fn the_framing_refuses_what_is_too_big_or_cut_short() {
     wire.extend_from_slice(b"{}");
     let e = read_message::<_, Command>(&mut wire.as_slice(), 1 << 20).unwrap_err();
     assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn a_key_from_before_editing_commands_still_reads() {
+    // The fixture from before `commands` existed stays as it was: no field, no commands.
+    let plain = std::fs::read_to_string(dir("to-helper").join("key.json")).unwrap();
+    assert!(!plain.contains("commands"), "{plain}");
+    let key: Command = serde_json::from_str(&plain).unwrap();
+    assert!(matches!(key, Command::Key { commands, .. } if commands.is_empty()));
 }
 
 #[test]

@@ -205,6 +205,10 @@ pub struct Entry {
     pub repaint_at: Option<Instant>,
     pub jobs: HashMap<i32, Job>,
     pub next_cdp: i32,
+    /// The developer tools were asked for: until this time the helper brings their window to the
+    /// front (the engine makes it a moment later, and a background app's windows do not come
+    /// forward by themselves).
+    pub devtools_front: Option<Instant>,
     pub closing: bool,
 }
 

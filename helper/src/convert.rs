@@ -136,6 +136,39 @@ pub fn key_event_of(kind: KeyKind, key: &KeyData) -> KeyEvent {
     }
 }
 
+/// The header bateri's proxy puts on the answer it makes up when it cannot reach the server: the
+/// Chromium net error (a negative number) the failure stands for.
+pub const NET_ERROR_HEADER: &str = "X-Bateri-Net-Error";
+
+/// The code a `NET_ERROR_HEADER` value carries; anything that is not a Chromium net error
+/// (-1 to -999) is not one.
+pub fn net_error_code(value: &str) -> Option<i32> {
+    value
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|code| (-999..=-1).contains(code))
+}
+
+/// What a net error is called (the short name Chromium shows on its own error pages).
+pub fn net_error_name(code: i32) -> String {
+    match code {
+        -2 => "ERR_FAILED".into(),
+        -7 => "ERR_TIMED_OUT".into(),
+        -100 => "ERR_CONNECTION_CLOSED".into(),
+        -101 => "ERR_CONNECTION_RESET".into(),
+        -102 => "ERR_CONNECTION_REFUSED".into(),
+        -103 => "ERR_CONNECTION_ABORTED".into(),
+        -104 => "ERR_CONNECTION_FAILED".into(),
+        -105 => "ERR_NAME_NOT_RESOLVED".into(),
+        -106 => "ERR_INTERNET_DISCONNECTED".into(),
+        -109 => "ERR_ADDRESS_UNREACHABLE".into(),
+        -118 => "ERR_CONNECTION_TIMED_OUT".into(),
+        -130 => "ERR_PROXY_CONNECTION_FAILED".into(),
+        other => format!("net error {other}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +210,18 @@ mod tests {
             Cursor::ResizeNorthEastSouthWest
         );
         assert_eq!(cursor_of(&CursorType::NONE), Cursor::Hidden);
+    }
+
+    #[test]
+    fn the_proxys_net_error_header_is_read() {
+        assert_eq!(net_error_code("-102"), Some(-102));
+        assert_eq!(net_error_code(" -118 "), Some(-118));
+        for bad in ["", "0", "102", "-1000", "refused", "-1.5", "-102x"] {
+            assert_eq!(net_error_code(bad), None, "{bad:?}");
+        }
+        assert_eq!(net_error_name(-102), "ERR_CONNECTION_REFUSED");
+        assert_eq!(net_error_name(-130), "ERR_PROXY_CONNECTION_FAILED");
+        assert_eq!(net_error_name(-321), "net error -321");
     }
 
     #[test]

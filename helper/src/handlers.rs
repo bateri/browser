@@ -6,7 +6,7 @@
 //! and so keep what they need in their own fields.
 
 use crate::agent::Observer;
-use crate::convert::{cursor_of, key_kind_of};
+use crate::convert::{NET_ERROR_HEADER, cursor_of, key_kind_of, net_error_code, net_error_name};
 use crate::rules::{self, level_to_ratio};
 use crate::state::{Creds, browser_of, emit, next_req, with, with_entry};
 use crate::{agent, trace};
@@ -344,6 +344,77 @@ fn ask_window(id: u32, url: &str, background: bool) {
     }
 }
 
+// Sets the error of a page the proxy answered for a server it could not reach, on the UI thread
+// (the answer is seen on the IO thread).
+wrap_task! {
+    struct NetErrorSet {
+        id: u32,
+        url: String,
+        code: i32,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            with_entry(self.id, |e| {
+                e.error = Some(LoadError {
+                    url: self.url.clone(),
+                    code: self.code,
+                    message: net_error_name(self.code),
+                })
+            });
+            push_state(self.id);
+        }
+    }
+}
+
+// For the page's own document: when bateri's proxy could not reach the server it answers itself (a
+// 502 whose body says why) and names the Chromium error in a header, and the page has then failed
+// to load as far as bateri is concerned. The engine draws the proxy's body; the sub-resources of a
+// page (pictures, requests) have no error to report.
+wrap_resource_request_handler! {
+    struct Documents {
+        id: u32,
+    }
+
+    impl ResourceRequestHandler {
+        /// The default of an unanswered call is to cancel the request: this handler never
+        /// interferes with the load.
+        fn on_before_resource_load(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _request: Option<&mut Request>,
+            _callback: Option<&mut Callback>,
+        ) -> ReturnValue {
+            ReturnValue::CONTINUE
+        }
+
+        /// IO thread: nothing here may touch the UI thread's state.
+        fn on_resource_response(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+            response: Option<&mut Response>,
+        ) -> ::std::os::raw::c_int {
+            let (Some(request), Some(response)) = (request, response) else { return 0 };
+            if !frame.is_some_and(|f| f.is_main() != 0) || request.resource_type() != ResourceType::MAIN_FRAME {
+                return 0;
+            }
+            // Only bateri's proxy answers with a 502 and this header: a page's own server (reached
+            // through the proxy) sending the header on any other status is not a failed load.
+            if response.status() != 502 {
+                return 0;
+            }
+            let header = userfree(response.header_by_name(Some(&NET_ERROR_HEADER.into())));
+            let Some(code) = net_error_code(&header) else { return 0 };
+            let mut task = NetErrorSet::new(self.id, userfree(request.url()), code);
+            post_task(ThreadId::UI, Some(&mut task));
+            0
+        }
+    }
+}
+
 wrap_request_handler! {
     struct Requests {
         id: u32,
@@ -351,6 +422,20 @@ wrap_request_handler! {
     }
 
     impl RequestHandler {
+        /// Documents (not the sub-resources of a page) go through `Documents`.
+        fn resource_request_handler(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _request: Option<&mut Request>,
+            is_navigation: ::std::os::raw::c_int,
+            _is_download: ::std::os::raw::c_int,
+            _request_initiator: Option<&CefString>,
+            _disable_default_handling: Option<&mut ::std::os::raw::c_int>,
+        ) -> Option<ResourceRequestHandler> {
+            (is_navigation != 0).then(|| Documents::new(self.id))
+        }
+
         fn on_before_browse(
             &self,
             _browser: Option<&mut Browser>,

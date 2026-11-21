@@ -8,7 +8,8 @@ use objc2::{
     rc::Retained,
     runtime::{AnyObject, Bool},
 };
-use objc2_app_kit::{NSApp, NSApplication, NSEvent};
+use objc2_app_kit::{NSApp, NSApplication, NSEvent, NSEventMask, NSWindow};
+use objc2_foundation::{NSDate, NSDefaultRunLoopMode};
 use std::cell::Cell;
 
 #[derive(Default)]
@@ -78,4 +79,63 @@ pub fn setup_application() {
         NSApp(MainThreadMarker::new().expect("main thread"))
             .isKindOfClass(HelperApplication::class())
     );
+}
+
+/// Puts the helper's windows in front, and the helper in front of the other apps: it is a
+/// background app (`LSUIElement`), so the developer tools' window would otherwise open behind
+/// whatever the person is looking at. Returns whether a window is up now.
+pub fn show_windows() -> bool {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    let app = NSApp(mtm);
+    let windows: Vec<Retained<NSWindow>> = app.windows().iter().collect();
+    let mut shown = false;
+    for window in &windows {
+        if !window.isVisible() {
+            window.makeKeyAndOrderFront(None);
+        }
+        shown |= window.isVisible();
+    }
+    if shown {
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
+    }
+    shown
+}
+
+/// Whether a window of the helper's own (the developer tools') is on screen. A closed window
+/// stays in the application's list (measured: it was still there seconds later), so the list
+/// alone says nothing.
+pub fn has_windows() -> bool {
+    MainThreadMarker::new().is_some_and(|mtm| NSApp(mtm).windows().iter().any(|w| w.isVisible()))
+}
+
+/// Lets AppKit take its turn. The off-screen pages need none of it, but a window does: it is
+/// ordered in, drawn, moved and typed into through the application's event queue, which nothing
+/// here runs (the helper's own loop waits on bateri's commands, not on `[NSApp run]`). Called
+/// every turn of the main loop while a window exists, so it must stay cheap.
+pub fn pump_events() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApp(mtm);
+    if app.windows().count() == 0 {
+        return;
+    }
+    let past = NSDate::distantPast();
+    loop {
+        let event = unsafe {
+            app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                NSEventMask::Any,
+                Some(&past),
+                NSDefaultRunLoopMode,
+                true,
+            )
+        };
+        match event {
+            Some(event) => app.sendEvent(&event),
+            None => break,
+        }
+    }
 }

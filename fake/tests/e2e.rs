@@ -40,6 +40,7 @@ fn key(fake: &Fake, id: u32, kind: KeyKind, vk: i32, native: i32, ch: u16, mods:
             mods,
             system: false,
         },
+        commands: vec![],
     });
 }
 
@@ -1302,15 +1303,232 @@ fn a_page_with_many_origins_is_answered_every_time_with_the_right_identity() {
     );
 }
 
+/// A key of the Mac keyboard as the system reports it, with the editing commands its key bindings
+/// made of it (`doCommandBySelector:`): a key down that carries them, and the key up.
+struct Chord {
+    vk: i32,
+    native: i32,
+    character: u16,
+    unmodified: u16,
+    mods: u32,
+    commands: &'static [&'static str],
+}
+
+const CMD_LEFT: Chord = Chord {
+    vk: 37,
+    native: 123,
+    character: 0xF702,
+    unmodified: 0xF702,
+    mods: modifier::COMMAND,
+    commands: &["moveToBeginningOfLine:"],
+};
+const CMD_RIGHT: Chord = Chord {
+    vk: 39,
+    native: 124,
+    character: 0xF703,
+    unmodified: 0xF703,
+    mods: modifier::COMMAND,
+    commands: &["moveToEndOfLine:"],
+};
+const CMD_UP: Chord = Chord {
+    vk: 38,
+    native: 126,
+    character: 0xF700,
+    unmodified: 0xF700,
+    mods: modifier::COMMAND,
+    commands: &["moveToBeginningOfDocument:"],
+};
+const CMD_DOWN: Chord = Chord {
+    vk: 40,
+    native: 125,
+    character: 0xF701,
+    unmodified: 0xF701,
+    mods: modifier::COMMAND,
+    commands: &["moveToEndOfDocument:"],
+};
+const CMD_SHIFT_LEFT: Chord = Chord {
+    vk: 37,
+    native: 123,
+    character: 0xF702,
+    unmodified: 0xF702,
+    mods: modifier::COMMAND | modifier::SHIFT,
+    commands: &["moveToBeginningOfLineAndModifySelection:"],
+};
+const CMD_BACKSPACE: Chord = Chord {
+    vk: 8,
+    native: 51,
+    character: 0x7F,
+    unmodified: 0x7F,
+    mods: modifier::COMMAND,
+    commands: &["deleteToBeginningOfLine:"],
+};
+const CMD_A: Chord = Chord {
+    vk: 65,
+    native: 0,
+    character: 'a' as u16,
+    unmodified: 'a' as u16,
+    mods: modifier::COMMAND,
+    commands: &["selectAll:"],
+};
+const CTRL_A: Chord = Chord {
+    vk: 65,
+    native: 0,
+    character: 1,
+    unmodified: 'a' as u16,
+    mods: modifier::CONTROL,
+    commands: &["moveToBeginningOfParagraph:"],
+};
+const CTRL_E: Chord = Chord {
+    vk: 69,
+    native: 14,
+    character: 5,
+    unmodified: 'e' as u16,
+    mods: modifier::CONTROL,
+    commands: &["moveToEndOfParagraph:"],
+};
+const CTRL_K: Chord = Chord {
+    vk: 75,
+    native: 40,
+    character: 11,
+    unmodified: 'k' as u16,
+    mods: modifier::CONTROL,
+    commands: &["deleteToEndOfParagraph:"],
+};
+
+fn chord(fake: &Fake, id: u32, c: &Chord) {
+    let data = KeyData {
+        vk: c.vk,
+        native: c.native,
+        character: c.character,
+        unmodified: c.unmodified,
+        mods: c.mods,
+        system: c.mods & modifier::COMMAND != 0,
+    };
+    fake.send(Command::Key {
+        browser: id,
+        kind: KeyKind::Down,
+        key: data,
+        commands: c.commands.iter().map(|n| n.to_string()).collect(),
+    });
+    fake.send(Command::Key {
+        browser: id,
+        kind: KeyKind::Up,
+        key: data,
+        commands: vec![],
+    });
+}
+
+/// A page with a field and a text area whose value the title reports after every edit (`v:`) and
+/// after the Q key goes down (`done<n>:<value>:<last key>`; a key down without its character
+/// inserts nothing, so it marks "every key before has been handled").
+const EDITING_PAGE: &str = "<title>t</title><body style='margin:0'><p>text</p>\
+    <input id=i style='position:absolute;left:10px;top:100px;width:200px;height:30px' value=''>\
+    <textarea id=t style='position:absolute;left:10px;top:150px;width:200px;height:80px'></textarea>\
+    <script>let n=0;let k='';\
+    addEventListener('input',e=>{document.title='v:'+e.target.value});\
+    addEventListener('keydown',e=>{if(e.key==='q'){\
+      document.title='done'+(++n)+':'+(document.activeElement.value??'')+':'+k}\
+      else{k=e.key+':'+e.metaKey}});\
+    </script>";
+
+/// Where the field and the text area are, to click into.
+const FIELD: (i32, i32) = (150, 115);
+const AREA: (i32, i32) = (150, 190);
+
+/// Sends Q (no character) and waits for the page to say it handled it: the page has taken every key before it.
+/// `round` counts the marks of this page from 1. Returns the title it made.
+fn marked(fake: &mut Fake, round: u32) -> String {
+    tap(fake, 1, 81, 12, 'q' as u16, 0);
+    let prefix = format!("done{round}:");
+    fake.state_where(1, |s| s.title.starts_with(&prefix)).title
+}
+
+fn unhandled_downs(fake: &Fake, vk: i32) -> usize {
+    fake.history()
+        .iter()
+        .filter(
+            |e| matches!(e, Event::UnhandledKey { kind: KeyKind::Down, key, .. } if key.vk == vk),
+        )
+        .count()
+}
+
 #[test]
 #[ignore]
-fn command_arrows_come_back_with_nothing_focused_and_in_a_field() {
+fn command_arrows_come_back_outside_a_field_and_edit_inside_one() {
+    let mut fake = Fake::start();
+    serve(&fake, EDITING_PAGE);
+    fake.open(1, profile("a", None), 400, 300, 1.0);
+    fake.go(1, "http://page.test/");
+    fake.send(Command::Focus {
+        browser: 1,
+        on: true,
+    });
+    // Nothing focused: the page's script sees ⌘← as a key of its own (`ArrowLeft`, command down),
+    // nobody has a use for the command, and it comes back, the way the browserpen's back key needs.
+    chord(&fake, 1, &CMD_LEFT);
+    assert_eq!(marked(&mut fake, 1), "done1::ArrowLeft:true");
+    chord(&fake, 1, &CMD_RIGHT);
+    marked(&mut fake, 2);
+    assert_eq!(
+        (unhandled_downs(&fake, 37), unhandled_downs(&fake, 39)),
+        (1, 1),
+        "{}",
+        fake.recent(20)
+    );
+    // In the field: ⌘← takes the caret to the line's start and does not come back. Typing after it
+    // shows where the caret is.
+    fake.click(1, FIELD.0, FIELD.1);
+    for c in "hello".chars() {
+        type_char(&fake, 1, c);
+    }
+    chord(&fake, 1, &CMD_LEFT);
+    type_char(&fake, 1, 'X');
+    chord(&fake, 1, &CMD_RIGHT);
+    type_char(&fake, 1, 'Y');
+    assert!(
+        marked(&mut fake, 3).starts_with("done3:XhelloY:"),
+        "{}",
+        fake.recent(20)
+    );
+    assert_eq!(
+        (unhandled_downs(&fake, 37), unhandled_downs(&fake, 39)),
+        (1, 1),
+        "the field used both: {}",
+        fake.recent(20)
+    );
+}
+
+/// Starts the editing page, clicks into the field and hands the browser over.
+fn editing_page() -> Fake {
+    let mut fake = Fake::start();
+    serve(&fake, EDITING_PAGE);
+    fake.open(1, profile("a", None), 400, 300, 1.0);
+    fake.go(1, "http://page.test/");
+    fake.send(Command::Focus {
+        browser: 1,
+        on: true,
+    });
+    fake
+}
+
+fn type_text(fake: &Fake, text: &str) {
+    for c in text.chars() {
+        type_char(fake, 1, c);
+    }
+}
+
+#[test]
+#[ignore]
+fn a_page_that_prevents_a_key_stops_its_commands() {
     let mut fake = Fake::start();
     serve(
         &fake,
-        "<title>t</title><body style='margin:0'><p>text</p>\
-         <input id=i style='position:absolute;left:10px;top:100px;width:200px;height:30px' value='hello'>\
-         <script>addEventListener('keydown',e=>{document.title='k:'+e.key+':'+e.metaKey})</script>",
+        "<title>t</title><body style='margin:0'>\
+         <input id=i style='position:absolute;left:10px;top:100px;width:200px;height:30px' value=''>\
+         <script>let n=0;\
+         addEventListener('keydown',e=>{if(e.key==='q'){document.title='done'+(++n)+':'+i.value;return}\
+           if(e.metaKey&&e.key==='ArrowLeft')e.preventDefault()});\
+         </script>",
     );
     fake.open(1, profile("a", None), 400, 300, 1.0);
     fake.go(1, "http://page.test/");
@@ -1318,44 +1536,367 @@ fn command_arrows_come_back_with_nothing_focused_and_in_a_field() {
         browser: 1,
         on: true,
     });
-    let left = |fake: &Fake| tap(fake, 1, 37, 123, 0xF702, modifier::COMMAND);
-    let right = |fake: &Fake| tap(fake, 1, 39, 124, 0xF703, modifier::COMMAND);
-    // Nothing focused: the page's script sees it, nobody uses it, it comes back.
-    left(&fake);
-    fake.title_is(1, "k:ArrowLeft:true");
-    right(&fake);
-    fake.title_is(1, "k:ArrowRight:true");
-    let downs = |fake: &Fake, vk: i32| {
-        fake.history()
-            .iter()
-            .filter(|e| matches!(e, Event::UnhandledKey { kind: KeyKind::Down, key, .. } if key.vk == vk && key.mods == modifier::COMMAND))
-            .count()
+    fake.click(1, FIELD.0, FIELD.1);
+    type_text(&fake, "hello");
+    // The page takes ⌘← for itself: the caret stays, and the key is not offered to bateri either
+    // (the page used it). ⌘→ the page leaves alone, and the field takes it.
+    chord(&fake, 1, &CMD_LEFT);
+    type_char(&fake, 1, 'X');
+    chord(&fake, 1, &CMD_RIGHT);
+    type_char(&fake, 1, 'Y');
+    assert_eq!(marked(&mut fake, 1), "done1:helloXY");
+    assert_eq!(unhandled_downs(&fake, 37), 0, "{}", fake.recent(20));
+    assert_eq!(unhandled_downs(&fake, 39), 0, "{}", fake.recent(20));
+}
+
+#[test]
+#[ignore]
+fn the_systems_line_and_document_commands_edit_a_field_and_a_text_area() {
+    let mut fake = editing_page();
+    let at = |fake: &mut Fake, round: u32| {
+        let title = marked(fake, round);
+        title.split(':').nth(1).unwrap_or("?").to_string()
     };
-    // A sentinel after them, so everything before has been told.
-    tap(&fake, 1, 67, 8, 99, 0);
-    fake.wait(SHORT, |e| match e {
-        Event::UnhandledKey {
-            kind: KeyKind::Up,
-            key,
-            ..
-        } if key.vk == 67 => Some(()),
-        _ => None,
+    fake.click(1, FIELD.0, FIELD.1);
+    type_text(&fake, "one two");
+    // ⌃A and ⌃E: start and end of the line.
+    chord(&fake, 1, &CTRL_A);
+    type_char(&fake, 1, '<');
+    chord(&fake, 1, &CTRL_E);
+    type_char(&fake, 1, '>');
+    assert_eq!(at(&mut fake, 1), "<one two>");
+    // ⌃K deletes to the line's end, from the start: all of it.
+    chord(&fake, 1, &CTRL_A);
+    chord(&fake, 1, &CTRL_K);
+    type_text(&fake, "new line");
+    assert_eq!(at(&mut fake, 2), "new line");
+    // ⌘⌫ deletes back to the line's start, ⌘⇧← selects back to it and the next key replaces.
+    chord(&fake, 1, &CMD_BACKSPACE);
+    type_text(&fake, "again");
+    chord(&fake, 1, &CMD_SHIFT_LEFT);
+    type_char(&fake, 1, 'Z');
+    assert_eq!(at(&mut fake, 3), "Z");
+    // ⌘A selects all and typing replaces it.
+    type_text(&fake, "abc");
+    chord(&fake, 1, &CMD_A);
+    type_char(&fake, 1, 'K');
+    assert_eq!(at(&mut fake, 4), "K");
+    // None of that was offered to bateri (the letters typed in between come back, they are not
+    // the chords: those carry a modifier).
+    let offered = fake
+        .history()
+        .iter()
+        .filter(
+            |e| matches!(e, Event::UnhandledKey { kind: KeyKind::Down, key, .. } if key.mods != 0),
+        )
+        .count();
+    assert_eq!(offered, 0, "{}", fake.recent(20));
+    // The document commands in a text area: ⌘↑ the very start, ⌘↓ the very end, over two lines.
+    fake.click(1, AREA.0, AREA.1);
+    type_char(&fake, 1, 'a');
+    key(&fake, 1, KeyKind::Down, 13, 36, '\r' as u16, 0);
+    key(&fake, 1, KeyKind::Char, 13, 36, '\r' as u16, 0);
+    key(&fake, 1, KeyKind::Up, 13, 36, '\r' as u16, 0);
+    type_char(&fake, 1, 'b');
+    chord(&fake, 1, &CMD_UP);
+    type_char(&fake, 1, '^');
+    chord(&fake, 1, &CMD_DOWN);
+    type_char(&fake, 1, '$');
+    // marked() reports the focused element's value: the text area's.
+    // (the title folds a line break into a space)
+    assert_eq!(at(&mut fake, 5), "^a b$");
+}
+
+/// The tests that run in the same machine as a person share their system pasteboard: its text is
+/// put back when the test is over, however it ends.
+struct Pasteboard {
+    saved: Vec<u8>,
+}
+
+impl Pasteboard {
+    fn take() -> Self {
+        let out = std::process::Command::new("pbpaste")
+            .output()
+            .expect("pbpaste");
+        Self { saved: out.stdout }
+    }
+
+    fn set(&self, text: &str) {
+        self.put(text.as_bytes());
+    }
+
+    fn put(&self, bytes: &[u8]) {
+        use std::io::Write;
+        let mut child = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("pbcopy");
+        child.stdin.take().unwrap().write_all(bytes).unwrap();
+        child.wait().unwrap();
+    }
+
+    fn text(&self) -> String {
+        let out = std::process::Command::new("pbpaste")
+            .output()
+            .expect("pbpaste");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+}
+
+impl Drop for Pasteboard {
+    fn drop(&mut self) {
+        self.put(&self.saved);
+    }
+}
+
+#[test]
+#[ignore]
+fn the_edit_menu_copies_cuts_pastes_and_undoes_with_the_system_pasteboard() {
+    let board = Pasteboard::take();
+    let token = format!("bateri-test-{}", std::process::id());
+    board.set("before");
+    let mut fake = editing_page();
+    let edit = |fake: &Fake, action: EditAction| fake.send(Command::Edit { browser: 1, action });
+    fake.click(1, FIELD.0, FIELD.1);
+    type_text(&fake, &token);
+    let value = |fake: &mut Fake, round: u32| {
+        let title = marked(fake, round);
+        title.split(':').nth(1).unwrap_or("?").to_string()
+    };
+    assert_eq!(value(&mut fake, 1), token);
+    // Select all and copy: the text is on the system's pasteboard.
+    edit(&fake, EditAction::SelectAll);
+    edit(&fake, EditAction::Copy);
+    wait_until("the page's selection on the pasteboard", || {
+        board.text() == token
     });
-    assert_eq!((downs(&fake, 37), downs(&fake, 39)), (1, 1));
-    // With the caret in a field, where ⌘← would be an editing command: the off-screen engine does
-    // not use it either, so it comes back too (bateri cannot tell a field has the caret from
-    // this, only from what it knows of the page).
-    fake.click(1, 100, 115);
-    left(&fake);
-    right(&fake);
-    tap(&fake, 1, 68, 2, 100, 0);
-    fake.wait(SHORT, |e| match e {
-        Event::UnhandledKey {
-            kind: KeyKind::Up,
-            key,
-            ..
-        } if key.vk == 68 => Some(()),
-        _ => None,
+    // Paste at the end of the field: the text is there twice.
+    chord(&fake, 1, &CMD_RIGHT);
+    edit(&fake, EditAction::Paste);
+    assert_eq!(value(&mut fake, 2), format!("{token}{token}"));
+    // Cut takes it out and puts it on the pasteboard; undo and redo walk back and forth.
+    board.set("other");
+    edit(&fake, EditAction::SelectAll);
+    edit(&fake, EditAction::Cut);
+    assert_eq!(value(&mut fake, 3), "");
+    wait_until("the cut text on the pasteboard", || {
+        board.text() == format!("{token}{token}")
     });
-    assert_eq!((downs(&fake, 37), downs(&fake, 39)), (2, 2));
+    edit(&fake, EditAction::Undo);
+    assert_eq!(value(&mut fake, 4), format!("{token}{token}"));
+    edit(&fake, EditAction::Redo);
+    assert_eq!(value(&mut fake, 5), "");
+    // Outside a field the page's own selection is what is copied.
+    fake.click(1, 380, 20);
+    edit(&fake, EditAction::SelectAll);
+    edit(&fake, EditAction::Copy);
+    wait_until("the page's text on the pasteboard", || {
+        board.text().contains("text")
+    });
+}
+
+#[test]
+#[ignore]
+fn keys_and_commands_in_any_mix_keep_their_order() {
+    let mut fake = editing_page();
+    fake.click(1, FIELD.0, FIELD.1);
+    // A fixed pseudo-random run of letters and commands, sent back to back with nothing between:
+    // the text must come out as if every key had been taken in the order it was sent.
+    let mut text = String::new();
+    let mut caret = 0usize;
+    let mut seed = 0x2545F491u32;
+    for round in 1..=3u32 {
+        for _ in 0..120 {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            match (seed >> 24) % 8 {
+                0 => {
+                    chord(&fake, 1, &CMD_LEFT);
+                    caret = 0;
+                }
+                1 => {
+                    chord(&fake, 1, &CMD_RIGHT);
+                    caret = text.len();
+                }
+                2 => {
+                    chord(&fake, 1, &CMD_BACKSPACE);
+                    text.replace_range(..caret, "");
+                    caret = 0;
+                }
+                3 => {
+                    chord(&fake, 1, &CTRL_K);
+                    text.truncate(caret);
+                }
+                _ => {
+                    let c = (b'a' + ((seed >> 16) % 16) as u8) as char; // never `q`: the page's mark
+                    type_char(&fake, 1, c);
+                    text.insert(caret, c);
+                    caret += 1;
+                }
+            }
+        }
+        // Start each round from where the caret is known to be.
+        chord(&fake, 1, &CMD_RIGHT);
+        caret = text.len();
+        let title = marked(&mut fake, round);
+        assert_eq!(
+            title.split(':').nth(1).unwrap_or("?"),
+            text,
+            "round {round}: {}",
+            fake.recent(6)
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn the_developer_tools_command_opens_a_window_and_the_next_one_closes_it() {
+    // The helper is a background app: the window the engine makes for the developer tools has to
+    // be ordered in and the helper's event queue run, or it exists and is never seen. This one
+    // shows a window on screen for a moment.
+    let mut fake = Fake::start();
+    serve(&fake, "<title>t</title><body>a page</body>");
+    fake.open(1, profile("a", None), 400, 300, 1.0);
+    fake.go(1, "http://page.test/");
+    let on_screen = |fake: &Fake| fake.windows().iter().filter(|w| w.on_screen).count();
+    assert_eq!(on_screen(&fake), 0, "{:?}", fake.windows());
+    fake.send(Command::DevTools { browser: 1 });
+    wait_until("a window of the helper's own on screen", || {
+        on_screen(&fake) == 1
+    });
+    // The same command again takes it away (the closed window may stay in the list, off screen).
+    fake.send(Command::DevTools { browser: 1 });
+    wait_until("the window off screen", || on_screen(&fake) == 0);
+}
+
+/// What bateri's proxy answers when it cannot reach the server: a 502 with a sentence for the
+/// person and the Chromium error it stands for in a header.
+fn proxy_failure(code: i32, sentence: &str) -> Reply {
+    Reply {
+        status: 502,
+        headers: vec![
+            ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+            ("X-Bateri-Net-Error".into(), code.to_string()),
+        ],
+        body: sentence.as_bytes().to_vec(),
+    }
+}
+
+#[test]
+#[ignore]
+fn a_pages_own_document_the_proxy_could_not_fetch_is_a_load_error() {
+    let mut fake = Fake::start();
+    fake.proxy.respond(|seen| match seen.path.as_str() {
+        "/refused" => proxy_failure(-102, "localhost:8799: Connection refused (os error 61)"),
+        "/timeout" => proxy_failure(-118, "the server did not answer in time"),
+        "/plain-502" => Reply {
+            status: 502,
+            headers: vec![("Content-Type".into(), "text/plain".into())],
+            body: b"a bad gateway of some other proxy".to_vec(),
+        },
+        // A site's own answer carrying the header is not the proxy's.
+        "/spoof" => Reply {
+            status: 200,
+            headers: vec![
+                ("Content-Type".into(), "text/html".into()),
+                ("X-Bateri-Net-Error".into(), "-102".into()),
+            ],
+            body: b"<title>spoof</title>a page".to_vec(),
+        },
+        "/image" => Reply::html(
+            "<title>with image</title><img src='/missing.png'>\
+             <iframe src='/missing-frame'></iframe>",
+        ),
+        "/missing.png" | "/missing-frame" => proxy_failure(-102, "nothing listens there"),
+        _ => Reply::html("<title>fine</title>fine"),
+    });
+    fake.open(1, profile("a", None), 400, 300, 1.0);
+    // The document itself failed: the error names the page, the code and the error's name, and
+    // the load is over.
+    fake.go(1, "http://page.test/refused");
+    let state = fake.state_where(1, |s| s.error.is_some());
+    assert!(!state.loading, "{state:?}");
+    let error = state.error.expect("the load failed");
+    assert_eq!(error.url, "http://page.test/refused");
+    assert_eq!(error.code, -102);
+    assert_eq!(error.message, "ERR_CONNECTION_REFUSED");
+    // The next page starts clean, and a failure of another kind has its own code.
+    let state = fake.go(1, "http://page.test/");
+    assert!(state.error.is_none(), "{state:?}");
+    fake.go(1, "http://page.test/timeout");
+    let state = fake.state_where(1, |s| s.error.is_some());
+    assert_eq!(state.error.map(|e| e.code), Some(-118));
+    // A 502 with a body and without the header is a page like any other (with no body at all
+    // the engine makes its own error of it, as it always did).
+    let state = fake.go(1, "http://page.test/plain-502");
+    assert!(state.error.is_none(), "{state:?}");
+    let state = fake.go(1, "http://page.test/spoof");
+    assert!(state.error.is_none(), "{state:?}");
+    fake.title_is(1, "spoof");
+    // What a page loads for itself (a picture, a frame) fails without an error of the page's.
+    let state = fake.go(1, "http://page.test/image");
+    assert!(state.error.is_none(), "{state:?}");
+    fake.title_is(1, "with image");
+    std::thread::sleep(Duration::from_millis(500));
+    let last = fake
+        .history()
+        .iter()
+        .rev()
+        .find_map(|e| StateView::of(e, 1))
+        .expect("a state");
+    assert!(last.error.is_none(), "{last:?}");
+}
+
+#[test]
+#[ignore]
+fn the_helper_does_not_register_with_the_notification_center() {
+    // Chromium's macOS notification bridge starts a helper of its own ("(Alerts)") that registers
+    // the app with the system's notification center, and the system then asks the person to allow
+    // notifications for "bateri Browser". The helper never shows notifications (a page's request
+    // is refused), so it must never register. The system's notification daemon logs every
+    // connection with the path of the app it comes from: none may come from the app under test.
+    let started = {
+        let out = std::process::Command::new("date")
+            .arg("+%Y-%m-%d %H:%M:%S")
+            .output()
+            .expect("date");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let mut fake = Fake::start();
+    serve(&fake, "<title>t</title><body>a page</body>");
+    fake.open(1, profile("a", None), 400, 300, 1.0);
+    fake.go(1, "http://page.test/");
+    // The registration comes within a second of the start; the log takes a moment to be readable.
+    std::thread::sleep(Duration::from_secs(3));
+    let app = app_executable();
+    let bundle = app
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .unwrap();
+    let predicate = format!(
+        "process == \"usernoted\" AND eventMessage CONTAINS \"{}\"",
+        bundle.display()
+    );
+    let out = std::process::Command::new("/usr/bin/log")
+        .args([
+            "show",
+            "--info",
+            "--debug",
+            "--start",
+            &started,
+            "--predicate",
+            &predicate,
+        ])
+        .output()
+        .expect("log show");
+    let found: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains("usernoted"))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        found.is_empty(),
+        "the helper registered with the notification center:\n{}",
+        found.join("\n")
+    );
 }

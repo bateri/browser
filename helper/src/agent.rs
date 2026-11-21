@@ -51,6 +51,16 @@ fn to_dict(params: &Value) -> DictionaryValue {
                     let mut inner = to_dict(value);
                     dict.set_dictionary(Some(&key), Some(&mut inner));
                 }
+                // Lists of strings (the editing commands of a key).
+                Value::Array(items) => {
+                    let mut list = list_value_create().expect("list");
+                    for (at, item) in items.iter().enumerate() {
+                        if let Value::String(s) = item {
+                            list.set_string(at, Some(&s.as_str().into()));
+                        }
+                    }
+                    dict.set_list(Some(&key), Some(&mut list));
+                }
                 _ => {}
             }
         }
@@ -183,6 +193,24 @@ fn step(id: u32, mut job: Job) {
         with_entry(id, |e| e.jobs.remove(&message_id));
         finish(id, req, failed(&format!("{method} was not sent")));
     }
+}
+
+/// A protocol call whose answer nobody waits for (the page's own reaction is what matters), so no
+/// job. Its number comes from the same count as the jobs', and `on_result` lets an answer it does
+/// not know go. `false` when the call could not be sent.
+pub fn fire(id: u32, method: &'static str, params: Value) -> bool {
+    let Some(host) = browser_of(id).and_then(|b| b.host()) else {
+        return false;
+    };
+    let Some(message_id) = with_entry(id, |e| {
+        e.next_cdp += 1;
+        e.next_cdp
+    }) else {
+        return false;
+    };
+    crate::trace!("cdp {id}#{message_id} {method} {params}");
+    let mut dict = to_dict(&params);
+    host.execute_dev_tools_method(message_id, Some(&method.into()), Some(&mut dict)) != 0
 }
 
 fn failed(message: &str) -> AgentOutput {

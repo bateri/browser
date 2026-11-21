@@ -81,6 +81,18 @@ pub struct KeyData {
     pub system: bool,
 }
 
+/// What the Edit menu asks of the focused element.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EditAction {
+    Copy,
+    Cut,
+    Paste,
+    Undo,
+    Redo,
+    SelectAll,
+}
+
 /// What an agent points at.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -197,10 +209,24 @@ pub enum Command {
         dy: i32,
         mods: u32,
     },
+    /// A key. `commands` are the macOS editing commands the system's key bindings made of it
+    /// (`interpretKeyEvents` then `doCommandBySelector:`, the selector's name without the colon:
+    /// `moveToBeginningOfLine`, `deleteToBeginningOfLine`, `selectAll`). They go to the page with
+    /// the key and run only when the page lets the key's default happen and something can take
+    /// the command, like in Chrome: ⌘← in a text field moves the caret and is not reported back,
+    /// outside one it comes back as `Event::UnhandledKey`. Only `Down` carries them.
     Key {
         browser: u32,
         kind: KeyKind,
         key: KeyData,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        commands: Vec<String>,
+    },
+    /// An editing command of the Edit menu, for the focused element. A key is not the way to ask
+    /// for these: the page would have to bind them itself, and the clipboard is the system's.
+    Edit {
+        browser: u32,
+        action: EditAction,
     },
     /// Text the input method committed as a whole.
     ImeCommit {
@@ -499,6 +525,7 @@ impl Command {
             | Command::Mouse { browser, .. }
             | Command::Wheel { browser, .. }
             | Command::Key { browser, .. }
+            | Command::Edit { browser, .. }
             | Command::ImeCommit { browser, .. }
             | Command::ImeCompose { browser, .. }
             | Command::ImeCancel { browser }
@@ -531,6 +558,7 @@ impl Command {
             Command::Mouse { .. } => "mouse",
             Command::Wheel { .. } => "wheel",
             Command::Key { .. } => "key",
+            Command::Edit { .. } => "edit",
             Command::ImeCommit { .. } => "ime_commit",
             Command::ImeCompose { .. } => "ime_compose",
             Command::ImeCancel { .. } => "ime_cancel",

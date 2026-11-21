@@ -5,7 +5,7 @@ The hidden Chromium helper behind bateri's browser element, and the crate the tw
 bateri draws a terminal. A browser element needs a real engine, which is far too large to live in
 that process, so it runs here: a small macOS app (Chromium Embedded Framework, off-screen) that
 bateri downloads, verifies, starts with a single-use key, and talks to. The helper has no window
-and no Dock icon. Every page it draws reaches bateri as an `IOSurface` over a mach port; every
+(bar the developer tools', when asked for), no Dock icon and never asks to send notifications. Every page it draws reaches bateri as an `IOSurface` over a mach port; every
 click, key and command goes the other way over a unix socket.
 
 ## What is in here
