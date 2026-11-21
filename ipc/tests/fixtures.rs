@@ -81,6 +81,13 @@ fn commands() -> Vec<Command> {
             dy: -120,
             mods: 0,
         },
+        Command::CanScroll {
+            browser: 1,
+            req: 5,
+            x: 10,
+            y: 20,
+            dx: 30,
+        },
         Command::Windows {
             browser: 1,
             mode: NewWindows::Here,
@@ -285,6 +292,11 @@ fn events() -> Vec<Event> {
                 text: "hello".into(),
                 truncated: false,
             },
+        },
+        Event::CanScroll {
+            browser: 1,
+            req: 5,
+            can: false,
         },
         Event::Error {
             browser: Some(1),
@@ -564,6 +576,21 @@ fn a_menu_row_without_shortcut_and_a_pinch_without_scale_still_read() {
             scale: 1.0
         }
     );
+}
+
+#[test]
+fn the_side_buttons_of_a_mouse_go_by_their_names() {
+    // `mouse.json` stays as it was (a right button): the two new buttons are values of the same field.
+    for (name, want) in [("back", Button::Back), ("forward", Button::Forward)] {
+        let text = format!(
+            r#"{{"t":"mouse","browser":1,"kind":"up","x":1,"y":2,"button":"{name}","clicks":1,"mods":0}}"#
+        );
+        let Command::Mouse { button, .. } = serde_json::from_str(&text).unwrap() else {
+            panic!("not a mouse")
+        };
+        assert_eq!(button, want);
+        assert!(serde_json::to_string(&want).unwrap().contains(name));
+    }
 }
 
 #[test]

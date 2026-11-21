@@ -13,6 +13,7 @@ mod keys;
 mod mac;
 mod pinch;
 mod rules;
+mod scroll;
 mod state;
 mod switches;
 

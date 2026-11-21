@@ -265,7 +265,9 @@ fn failed(message: &str) -> AgentOutput {
 
 /// The answer to a protocol call.
 pub fn on_result(id: u32, message_id: i32, success: bool, bytes: &[u8]) {
-    if crate::pinch::on_result(id, message_id, success, bytes) {
+    if crate::pinch::on_result(id, message_id, success, bytes)
+        || crate::scroll::on_result(id, message_id, success, bytes)
+    {
         return;
     }
     let Some(Some(mut job)) = with_entry(id, |e| e.jobs.remove(&message_id)) else {

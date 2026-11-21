@@ -212,6 +212,9 @@ pub struct Entry {
     /// fails the key is sent again the engine's own way (see `agent::fire`).
     pub fired: HashMap<i32, Fired>,
     pub next_cdp: i32,
+    /// The questions of `Command::CanScroll` the page has not answered, by call number: the `req`
+    /// each answer is owed to.
+    pub scroll_asks: HashMap<i32, u32>,
     /// How bateri takes a window the browser's menu asks for (`Command::Windows`): the words of
     /// the rows that open.
     pub new_windows: browser_ipc::message::NewWindows,

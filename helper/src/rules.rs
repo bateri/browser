@@ -2,7 +2,7 @@
 //! called, how a zoom ratio maps to Chromium's zoom level. No engine in here, so they are tested
 //! without one.
 
-use browser_ipc::message::NewWindows;
+use browser_ipc::message::{MouseKind, NewWindows};
 
 /// The longest address the helper takes.
 pub const MAX_ADDRESS: usize = 8192;
@@ -353,6 +353,29 @@ pub fn clamp_view(width: u32, height: u32, scale: f32) -> (i32, i32, f32) {
     )
 }
 
+/// The protocol call for a side button of the mouse (`back` goes back, otherwise forward) at the
+/// point `(x, y)` of the page in CSS pixels. The engine's own mouse calls know three buttons; its
+/// protocol knows five, and with it the page gets `mousedown`, `mouseup` and `auxclick` with `button`
+/// 3 or 4 and the engine goes back or forward when the button is let go unless the page called
+/// `preventDefault` on that `mouseup` (or `pointerup`): what Chrome does, measured. A move has no
+/// button of this kind.
+pub fn side_button_call(kind: MouseKind, back: bool, x: f64, y: f64) -> Option<serde_json::Value> {
+    let (kind, buttons) = match kind {
+        // `buttons` is the set held: 8 and 16 are the fourth and fifth, and none after the release.
+        MouseKind::Down => ("mousePressed", if back { 8 } else { 16 }),
+        MouseKind::Up => ("mouseReleased", 0),
+        MouseKind::Move | MouseKind::Leave => return None,
+    };
+    Some(serde_json::json!({
+        "type": kind,
+        "x": x,
+        "y": y,
+        "button": if back { "back" } else { "forward" },
+        "buttons": buttons,
+        "clickCount": 1,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,6 +547,30 @@ mod tests {
             assert!(!profile_dir_ok(bad), "{bad:?}");
         }
         assert!(!profile_dir_ok(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn a_side_button_is_a_protocol_press_and_release() {
+        let down = side_button_call(MouseKind::Down, true, 5.0, 6.5).unwrap();
+        assert_eq!(down["type"], "mousePressed");
+        assert_eq!(down["button"], "back");
+        assert_eq!(down["buttons"], 8);
+        assert_eq!(
+            (down["x"].as_f64(), down["y"].as_f64()),
+            (Some(5.0), Some(6.5))
+        );
+        let up = side_button_call(MouseKind::Up, false, 5.0, 6.5).unwrap();
+        assert_eq!(
+            (up["type"].as_str(), up["button"].as_str()),
+            (Some("mouseReleased"), Some("forward"))
+        );
+        assert_eq!(up["buttons"], 0);
+        assert_eq!(
+            side_button_call(MouseKind::Down, false, 0.0, 0.0).unwrap()["buttons"],
+            16
+        );
+        assert!(side_button_call(MouseKind::Move, true, 0.0, 0.0).is_none());
+        assert!(side_button_call(MouseKind::Leave, true, 0.0, 0.0).is_none());
     }
 
     #[test]

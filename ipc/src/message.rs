@@ -77,6 +77,10 @@ pub enum Button {
     Left,
     Middle,
     Right,
+    /// The mouse's side button that goes back (`button` 3 of a `mouseup`).
+    Back,
+    /// The mouse's side button that goes forward (`button` 4).
+    Forward,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,6 +233,17 @@ pub enum Command {
         dx: i32,
         dy: i32,
         mods: u32,
+    },
+    /// Asks whether a sideways scroll at `(x, y)` would move something (the page, or a box under
+    /// the point): the answer is `Event::CanScroll`. `dx` is a wheel's (`Wheel::dx`) and only its
+    /// sign is read: it says which way the content would move. This is what tells a two-finger
+    /// swipe that belongs to the page from one that goes back or forward.
+    CanScroll {
+        browser: u32,
+        req: u32,
+        x: i32,
+        y: i32,
+        dx: i32,
     },
     /// How bateri takes a window the page or its menu asks for (`Event::Window`). Until it is said
     /// the helper words the menu for `NewWindows::Page`; say it again when it changes.
@@ -570,6 +585,13 @@ pub enum Event {
         req: u32,
         output: AgentOutput,
     },
+    /// The answer to `Command::CanScroll`: `can` says something there takes the scroll. A page
+    /// that could not be asked answers `true` (it keeps its gesture).
+    CanScroll {
+        browser: u32,
+        req: u32,
+        can: bool,
+    },
     /// Something the helper could not do; `browser` is set when one browser's.
     Error {
         browser: Option<u32>,
@@ -593,6 +615,7 @@ impl Command {
             | Command::Focus { browser, .. }
             | Command::Mouse { browser, .. }
             | Command::Wheel { browser, .. }
+            | Command::CanScroll { browser, .. }
             | Command::Windows { browser, .. }
             | Command::Pinch { browser, .. }
             | Command::Key { browser, .. }
@@ -628,6 +651,7 @@ impl Command {
             Command::Focus { .. } => "focus",
             Command::Mouse { .. } => "mouse",
             Command::Wheel { .. } => "wheel",
+            Command::CanScroll { .. } => "can_scroll",
             Command::Windows { .. } => "windows",
             Command::Pinch { .. } => "pinch",
             Command::Key { .. } => "key",
@@ -671,6 +695,7 @@ impl Event {
             Event::Download { .. } => "download",
             Event::DownloadProgress { .. } => "download_progress",
             Event::AgentResult { .. } => "agent_result",
+            Event::CanScroll { .. } => "can_scroll",
             Event::Error { .. } => "error",
         }
     }
@@ -694,7 +719,8 @@ impl Event {
             | Event::DialogVoid { browser, .. }
             | Event::FileDialog { browser, .. }
             | Event::Download { browser, .. }
-            | Event::AgentResult { browser, .. } => Some(*browser),
+            | Event::AgentResult { browser, .. }
+            | Event::CanScroll { browser, .. } => Some(*browser),
         }
     }
 }

@@ -3093,3 +3093,274 @@ fn an_images_menu_starts_with_the_rows_that_open_it_in_the_background_and_copy_i
     // Dismissed, it answers nothing.
     fake.send(Command::MenuResult { req, command: None });
 }
+
+// ---- the mouse's side buttons and the sideways swipe ----
+
+/// Reports the side buttons it hears through its title, and takes the mouse event the address
+/// names (`?mouseup` calls `preventDefault` on the `mouseup`).
+const SIDE_PAGE: &str = "<title>t</title><body style='margin:0'><div style='height:300px'>x</div>\
+    <script>const hold=location.search.slice(1);const seen=[];\
+    for(const t of ['mousedown','mouseup','auxclick'])addEventListener(t,e=>{\
+    seen.push(t+e.button);document.title=seen.join(' ');if(t===hold)e.preventDefault()})</script>";
+
+/// The fourth or fifth button of a mouse pressed and let go over the page.
+fn side(fake: &Fake, button: Button) {
+    fake.mouse(1, MouseKind::Move, 50, 50, Button::Left);
+    fake.mouse(1, MouseKind::Down, 50, 50, button);
+    fake.mouse(1, MouseKind::Up, 50, 50, button);
+}
+
+#[test]
+#[ignore]
+fn the_side_buttons_go_back_and_forward() {
+    let mut fake = Fake::start();
+    serve(&fake, SIDE_PAGE);
+    fake.open(1, profile("a", None), 400, 300, 1.0);
+    fake.go(1, "http://page.test/a");
+    fake.go(1, "http://page.test/b");
+    fake.go(1, "http://page.test/c");
+    fake.send(Command::Focus {
+        browser: 1,
+        on: true,
+    });
+    side(&fake, Button::Back);
+    fake.state_where(1, |s| s.url == "http://page.test/b" && !s.loading);
+    side(&fake, Button::Back);
+    let s = fake.state_where(1, |s| s.url == "http://page.test/a" && !s.loading);
+    assert!(s.can_forward);
+    side(&fake, Button::Forward);
+    fake.state_where(1, |s| s.url == "http://page.test/b" && !s.loading);
+    side(&fake, Button::Forward);
+    let s = fake.state_where(1, |s| s.url == "http://page.test/c" && !s.loading);
+    assert!(!s.can_forward);
+}
+
+#[test]
+#[ignore]
+fn a_page_that_takes_the_mouseup_keeps_the_side_button_from_going() {
+    let mut fake = Fake::start();
+    serve(&fake, SIDE_PAGE);
+    fake.open(1, profile("a", None), 400, 300, 1.0);
+    fake.send(Command::Focus {
+        browser: 1,
+        on: true,
+    });
+    // Back: the page hears the button as number 3 (down, up and the aux click), and its
+    // `preventDefault` on the `mouseup` is what Chrome honours.
+    fake.go(1, "http://page.test/a");
+    fake.go(1, "http://page.test/b?mouseup");
+    side(&fake, Button::Back);
+    fake.title_is(1, "mousedown3 mouseup3 auxclick3");
+    std::thread::sleep(Duration::from_millis(700));
+    fake.forget();
+    let s = fake.state_where(1, |_| true);
+    assert_eq!(s.url, "http://page.test/b?mouseup");
+    assert!(!s.loading);
+    // Forward: the button is number 4, and the same page keeps it.
+    fake.go(1, "http://page.test/c?mouseup");
+    fake.go(1, "http://page.test/d");
+    fake.send(Command::Back { browser: 1 });
+    let s = fake.state_where(1, |s| s.url == "http://page.test/c?mouseup" && !s.loading);
+    assert!(s.can_forward);
+    side(&fake, Button::Forward);
+    fake.title_is(1, "mousedown4 mouseup4 auxclick4");
+    std::thread::sleep(Duration::from_millis(700));
+    fake.forget();
+    let s = fake.state_where(1, |_| true);
+    assert_eq!(s.url, "http://page.test/c?mouseup");
+    // A page that only listens does not stop it.
+    fake.go(1, "http://page.test/e?auxclick");
+    side(&fake, Button::Back);
+    fake.state_where(1, |s| s.url == "http://page.test/c?mouseup" && !s.loading);
+}
+
+/// What a sideways scroll at a point meets, one page for each case: the wide page, a box that
+/// scrolls sideways (`/box?N` starts it at offset N), the same in a right-to-left page, a page that
+/// hides its sideways overflow or keeps its overscroll, a frame of another origin.
+fn sideways_pages(fake: &Fake) {
+    const BOX: &str = "position:absolute;left:0;top:0;width:200px;height:100px;overflow-x:auto;\
+        overflow-y:hidden;white-space:nowrap";
+    fake.proxy.respond(|seen| {
+        let path = seen.path.as_str();
+        let page = |html: &str| Reply::html(&format!("<!doctype html><title>t</title>{html}"));
+        if seen.host.starts_with("other.test") {
+            return page("<body style='margin:0'>inner");
+        }
+        if path.starts_with("/wide") {
+            page(
+                "<body style='margin:0;width:3000px;height:600px'>wide<script>\
+                 if(location.search=='?right')scrollTo(99999,0);\
+                 addEventListener('scroll',()=>document.title='x:'+Math.round(scrollX))</script>",
+            )
+        } else if path.starts_with("/box") {
+            page(&format!(
+                "<body style='margin:0;height:600px'><div id=b style='{BOX}'><div style='width:1000px;\
+                 height:50px'>wide</div></div><script>b.scrollLeft=+location.search.slice(1)||0</script>"
+            ))
+        } else if path.starts_with("/rtl") {
+            page(&format!(
+                "<body style='margin:0;height:600px'><div id=b dir=rtl style='{BOX}'><div style='width:1000px;\
+                 height:50px'>wide</div></div>"
+            ))
+        } else if path.starts_with("/hidden") {
+            Reply::html(
+                "<!doctype html><title>t</title><html style='overflow-x:hidden'>\
+                 <body style='margin:0;width:3000px;height:600px'>wide",
+            )
+        } else if path.starts_with("/kept") {
+            page("<body style='margin:0;width:3000px;height:600px;overscroll-behavior-x:none'>wide")
+        } else if path.starts_with("/quirks") {
+            Reply::html("<title>t</title><body style='margin:0;width:3000px;height:600px'>wide")
+        } else if path.starts_with("/frame") {
+            page(
+                "<body style='margin:0;height:600px'><iframe src='http://other.test/inner' \
+                 style='position:absolute;left:0;top:0;width:200px;height:100px;border:0'></iframe>",
+            )
+        } else {
+            page("<body style='margin:0;height:600px'>narrow")
+        }
+    });
+}
+
+/// Asks the helper whether a sideways scroll at `(x, y)` would move something (`dx` as a wheel's),
+/// and waits for the answer.
+fn can_scroll(fake: &mut Fake, x: i32, y: i32, dx: i32) -> bool {
+    static REQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(100);
+    let req = REQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    fake.send(Command::CanScroll {
+        browser: 1,
+        req,
+        x,
+        y,
+        dx,
+    });
+    fake.wait(SHORT, |e| match e {
+        Event::CanScroll { req: r, can, .. } if *r == req => Some(*can),
+        _ => None,
+    })
+}
+
+const ABOUT_BACK: i32 = 100;
+const ABOUT_FORWARD: i32 = -100;
+
+fn sideways_open(url: &str) -> Fake {
+    let mut fake = Fake::start();
+    sideways_pages(&fake);
+    fake.open(1, profile("a", None), 400, 300, 1.0);
+    fake.go(1, &format!("http://page.test/{url}"));
+    fake.send(Command::Focus {
+        browser: 1,
+        on: true,
+    });
+    fake
+}
+
+#[test]
+#[ignore]
+fn a_wheel_moves_the_page_by_the_sign_of_dx() {
+    let mut fake = sideways_open("wide");
+    fake.mouse(1, MouseKind::Move, 50, 50, Button::Left);
+    // A negative `dx` is the content moving left: the page scrolls to the right.
+    fake.send(Command::Wheel {
+        browser: 1,
+        x: 50,
+        y: 50,
+        dx: ABOUT_FORWARD * 2,
+        dy: 0,
+        mods: 0,
+    });
+    fake.state_where(1, |s| s.title.starts_with("x:") && s.title != "x:0");
+    fake.send(Command::Wheel {
+        browser: 1,
+        x: 50,
+        y: 50,
+        dx: ABOUT_BACK * 8,
+        dy: 0,
+        mods: 0,
+    });
+    fake.title_is(1, "x:0");
+}
+
+#[test]
+#[ignore]
+fn a_page_at_the_edge_lets_the_swipe_go_and_a_page_that_can_scroll_keeps_it() {
+    let mut fake = sideways_open("wide");
+    // At the left edge of a wide page: the content cannot move right, so that way is history's;
+    // the other way the page scrolls.
+    assert!(!can_scroll(&mut fake, 50, 50, ABOUT_BACK));
+    assert!(can_scroll(&mut fake, 50, 50, ABOUT_FORWARD));
+    // At the right edge it is the other way round.
+    fake.go(1, "http://page.test/wide?right");
+    assert!(can_scroll(&mut fake, 50, 50, ABOUT_BACK));
+    assert!(!can_scroll(&mut fake, 50, 50, ABOUT_FORWARD));
+    // A page that does not scroll sideways has nothing to keep.
+    fake.go(1, "http://page.test/narrow");
+    assert!(!can_scroll(&mut fake, 50, 50, ABOUT_BACK));
+    assert!(!can_scroll(&mut fake, 50, 50, ABOUT_FORWARD));
+    // Quirks mode scrolls through the body.
+    fake.go(1, "http://page.test/quirks");
+    assert!(!can_scroll(&mut fake, 50, 50, ABOUT_BACK));
+    assert!(can_scroll(&mut fake, 50, 50, ABOUT_FORWARD));
+    // A page that hides its sideways overflow cannot be scrolled that way, and one that keeps its
+    // overscroll does not let a gesture through to history (Chrome's own rule for both).
+    fake.go(1, "http://page.test/hidden");
+    assert!(!can_scroll(&mut fake, 50, 50, ABOUT_BACK));
+    assert!(!can_scroll(&mut fake, 50, 50, ABOUT_FORWARD));
+    fake.go(1, "http://page.test/kept");
+    assert!(can_scroll(&mut fake, 50, 50, ABOUT_BACK));
+    assert!(can_scroll(&mut fake, 50, 50, ABOUT_FORWARD));
+}
+
+#[test]
+#[ignore]
+fn a_box_under_the_finger_that_can_scroll_keeps_the_swipe() {
+    let mut fake = sideways_open("box?0");
+    // The box is at its start: its content cannot move right, and the page has no sideways
+    // scroll, so that is history's; the other way the box scrolls. Outside the box, nothing does.
+    assert!(!can_scroll(&mut fake, 50, 50, ABOUT_BACK));
+    assert!(can_scroll(&mut fake, 50, 50, ABOUT_FORWARD));
+    assert!(!can_scroll(&mut fake, 300, 200, ABOUT_FORWARD));
+    // In the middle of its way it takes both.
+    fake.go(1, "http://page.test/box?300");
+    assert!(can_scroll(&mut fake, 50, 50, ABOUT_BACK));
+    assert!(can_scroll(&mut fake, 50, 50, ABOUT_FORWARD));
+    assert!(!can_scroll(&mut fake, 300, 200, ABOUT_BACK));
+    // At its far end only the way back is the box's.
+    fake.go(1, "http://page.test/box?800");
+    assert!(can_scroll(&mut fake, 50, 50, ABOUT_BACK));
+    assert!(!can_scroll(&mut fake, 50, 50, ABOUT_FORWARD));
+    // A box that reads right to left starts at its right end.
+    fake.go(1, "http://page.test/rtl");
+    assert!(can_scroll(&mut fake, 50, 50, ABOUT_BACK));
+    assert!(!can_scroll(&mut fake, 50, 50, ABOUT_FORWARD));
+    // Page zoom moves the point: the view's (350, 50) is the page's (175, 25) at twice the size.
+    fake.go(1, "http://page.test/box?300");
+    assert!(!can_scroll(&mut fake, 350, 50, ABOUT_BACK));
+    fake.send(Command::Zoom {
+        browser: 1,
+        ratio: 2.0,
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(can_scroll(&mut fake, 350, 50, ABOUT_BACK));
+}
+
+#[test]
+#[ignore]
+fn a_frame_of_another_origin_keeps_the_swipe_and_a_pinched_view_pans_first() {
+    let mut fake = sideways_open("frame");
+    // What is in the frame cannot be seen from here: the page keeps the gesture, never history.
+    assert!(can_scroll(&mut fake, 50, 50, ABOUT_BACK));
+    assert!(can_scroll(&mut fake, 50, 50, ABOUT_FORWARD));
+    assert!(!can_scroll(&mut fake, 300, 200, ABOUT_BACK));
+    // Zoomed with the fingers the visual viewport has room to move before history is asked: here
+    // it is at the left edge of a page that does not scroll sideways.
+    fake.go(1, "http://page.test/narrow");
+    pinch(&fake, PinchKind::Begin, 0, 150, 1.0);
+    for _ in 0..4 {
+        pinch(&fake, PinchKind::Update, 0, 150, 2.0_f64.powf(0.25));
+    }
+    pinch(&fake, PinchKind::End, 0, 150, 1.0);
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(!can_scroll(&mut fake, 50, 50, ABOUT_BACK));
+    assert!(can_scroll(&mut fake, 50, 50, ABOUT_FORWARD));
+}

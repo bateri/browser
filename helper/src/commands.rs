@@ -633,6 +633,19 @@ fn apply(id: u32, browser: &Browser, command: Command) {
                 Button::Left => MouseButtonType::LEFT,
                 Button::Middle => MouseButtonType::MIDDLE,
                 Button::Right => MouseButtonType::RIGHT,
+                Button::Back | Button::Forward => {
+                    let ratio = rules::level_to_ratio(host.zoom_level());
+                    let call = rules::side_button_call(
+                        kind,
+                        button == Button::Back,
+                        f64::from(x) / ratio,
+                        f64::from(y) / ratio,
+                    );
+                    if let Some(params) = call {
+                        agent::call(id, "Input.dispatchMouseEvent", params, |_| {});
+                    }
+                    return;
+                }
             };
             let clicks = clicks.clamp(1, 3) as i32;
             crate::mac::input_now(|| match kind {
@@ -642,6 +655,7 @@ fn apply(id: u32, browser: &Browser, command: Command) {
                 MouseKind::Up => host.send_mouse_click_event(Some(&event), button, 1, clicks),
             });
         }
+        Command::CanScroll { req, x, y, dx, .. } => crate::scroll::ask(id, req, x, y, dx),
         Command::Windows { mode, .. } => {
             with_entry(id, |e| e.new_windows = mode);
         }
