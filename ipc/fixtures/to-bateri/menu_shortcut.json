@@ -1,0 +1,21 @@
+{
+  "e": "menu",
+  "browser": 1,
+  "req": 3,
+  "x": 5,
+  "y": 6,
+  "items": [
+    {
+      "command": 26500,
+      "label": "Zoom In",
+      "enabled": true,
+      "checked": false,
+      "separator": false,
+      "shortcut": "⌘+"
+    }
+  ],
+  "link": null,
+  "source": null,
+  "selection": null,
+  "editable": false
+}

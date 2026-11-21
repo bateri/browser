@@ -8,7 +8,9 @@
 use crate::agent::Observer;
 use crate::convert::{NET_ERROR_HEADER, cursor_of, key_kind_of, net_error_code, net_error_name};
 use crate::rules::{self, level_to_ratio};
-use crate::state::{Creds, Download, browser_of, emit, next_req, take_where, with, with_entry};
+use crate::state::{
+    Creds, Download, OpenMenu, browser_of, emit, next_req, take_where, with, with_entry,
+};
 use crate::{agent, trace};
 use browser_ipc::message::*;
 use browser_ipc::{Frame as PixelFrame, KIND_POPUP, KIND_VIEW, Sent};
@@ -624,6 +626,18 @@ wrap_keyboard_handler! {
     }
 }
 
+/// A line between two groups of rows in the page's menu.
+fn separator() -> MenuItem {
+    MenuItem {
+        command: 0,
+        label: String::new(),
+        enabled: false,
+        checked: false,
+        separator: true,
+        shortcut: String::new(),
+    }
+}
+
 /// The engine's "view page source" command number.
 fn view_source_command() -> i32 {
     sys::cef_menu_id_t::MENU_ID_VIEW_SOURCE as i32
@@ -637,7 +651,7 @@ wrap_context_menu_handler! {
     impl ContextMenuHandler {
         fn run_context_menu(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             _frame: Option<&mut Frame>,
             params: Option<&mut ContextMenuParams>,
             model: Option<&mut MenuModel>,
@@ -653,7 +667,7 @@ wrap_context_menu_handler! {
                 if kind == MenuItemType::SEPARATOR {
                     // Two separators in a row, or one at an end, say nothing.
                     if !items.is_empty() && items.last().is_some_and(|m: &MenuItem| !m.separator) {
-                        items.push(MenuItem { command: 0, label: String::new(), enabled: false, checked: false, separator: true });
+                        items.push(separator());
                     }
                 } else if kind == MenuItemType::COMMAND || kind == MenuItemType::CHECK || kind == MenuItemType::RADIO {
                     items.push(MenuItem {
@@ -662,6 +676,7 @@ wrap_context_menu_handler! {
                         enabled: model.is_enabled_at(i) != 0,
                         checked: model.is_checked_at(i) != 0,
                         separator: false,
+                        shortcut: String::new(),
                     });
                 }
             }
@@ -672,10 +687,31 @@ wrap_context_menu_handler! {
                 callback.cancel();
                 return 1;
             }
+            // Zoom and Inspect at the end, as they are the browser's own and not the page's: the
+            // helper runs them (`MenuResult`).
+            let ratio = browser
+                .and_then(|b| b.host())
+                .map_or(1.0, |h| level_to_ratio(h.zoom_level()));
+            items.push(separator());
+            for row in rules::OwnRow::ALL {
+                if row == rules::OwnRow::Inspect {
+                    items.push(separator());
+                }
+                items.push(MenuItem {
+                    command: row.command(),
+                    label: row.label().into(),
+                    enabled: row.enabled(ratio),
+                    checked: false,
+                    separator: false,
+                    shortcut: row.shortcut().into(),
+                });
+            }
             let non_empty = |s: String| (!s.is_empty()).then_some(s);
             let req = next_req();
             let offered: Vec<i32> = items.iter().filter(|m| !m.separator && m.enabled).map(|m| m.command).collect();
-            let stale = with(|s| s.pending.menus.insert(req, (self.id, callback.clone(), offered)));
+            let at = (params.xcoord(), params.ycoord());
+            let menu = OpenMenu { callback: callback.clone(), offered, at };
+            let stale = with(|s| s.pending.menus.insert(req, (self.id, menu)));
             drop(stale);
             emit(Event::Menu {
                 browser: self.id,

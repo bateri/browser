@@ -205,6 +205,25 @@ pub fn front_new_windows() -> usize {
     shown
 }
 
+/// Brings the windows that are on screen (the developer tools', the helper has no others) to the
+/// front, and the helper in front of the other apps: the tools asked to look at another element
+/// are already open, and their window may be behind whatever the person is looking at.
+pub fn front_open_windows() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApp(mtm);
+    let mut any = false;
+    for window in app.windows().iter().filter(|w| w.isVisible()) {
+        window.makeKeyAndOrderFront(None);
+        any = true;
+    }
+    if any {
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
+    }
+}
+
 /// Whether a window of the helper's own (the developer tools') is on screen. A closed window
 /// stays in the application's list (measured: it was still there seconds later), so the list
 /// alone says nothing.

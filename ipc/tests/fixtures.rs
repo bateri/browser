@@ -81,6 +81,13 @@ fn commands() -> Vec<Command> {
             dy: -120,
             mods: 0,
         },
+        Command::Pinch {
+            browser: 1,
+            kind: PinchKind::Update,
+            x: 10,
+            y: 20,
+            scale: 1.05,
+        },
         Command::Key {
             browser: 1,
             kind: KeyKind::Down,
@@ -220,6 +227,7 @@ fn events() -> Vec<Event> {
                     enabled: false,
                     checked: false,
                     separator: false,
+                    shortcut: String::new(),
                 },
                 MenuItem {
                     command: 0,
@@ -227,6 +235,7 @@ fn events() -> Vec<Event> {
                     enabled: false,
                     checked: false,
                     separator: true,
+                    shortcut: String::new(),
                 },
             ],
             link: Some("http://a.test/".into()),
@@ -351,7 +360,28 @@ fn every_event_has_its_fixture() {
     for e in &all {
         check("to-bateri", e.name(), e);
     }
+    // A row with keys of its own has a fixture besides the plain menu.
+    let with_shortcut = Event::Menu {
+        browser: 1,
+        req: 3,
+        x: 5,
+        y: 6,
+        items: vec![MenuItem {
+            command: 26500,
+            label: "Zoom In".into(),
+            enabled: true,
+            checked: false,
+            separator: false,
+            shortcut: "⌘+".into(),
+        }],
+        link: None,
+        source: None,
+        selection: None,
+        editable: false,
+    };
+    check("to-bateri", "menu_shortcut", &with_shortcut);
     let mut want: Vec<String> = all.iter().map(|e| e.name().to_string()).collect();
+    want.push("menu_shortcut".into());
     want.sort();
     assert_eq!(
         files("to-bateri"),
@@ -504,6 +534,30 @@ fn an_older_message_without_a_new_optional_field_still_reads() {
         Command::Reload {
             browser: 1,
             ignore_cache: false
+        }
+    );
+}
+
+#[test]
+fn a_menu_row_without_shortcut_and_a_pinch_without_scale_still_read() {
+    // The menu fixture from before `shortcut` existed stays as it was: no field, no keys.
+    let plain = std::fs::read_to_string(dir("to-bateri").join("menu.json")).unwrap();
+    assert!(!plain.contains("shortcut"), "{plain}");
+    let Event::Menu { items, .. } = serde_json::from_str(&plain).unwrap() else {
+        panic!("not a menu")
+    };
+    assert!(items.iter().all(|row| row.shortcut.is_empty()));
+    // `Begin` and `End` say no change.
+    let begin: Command =
+        serde_json::from_str(r#"{"t":"pinch","browser":1,"kind":"begin","x":4,"y":5}"#).unwrap();
+    assert_eq!(
+        begin,
+        Command::Pinch {
+            browser: 1,
+            kind: PinchKind::Begin,
+            x: 4,
+            y: 5,
+            scale: 1.0
         }
     );
 }

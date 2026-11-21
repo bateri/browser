@@ -200,6 +200,25 @@ fn step(id: u32, mut job: Job) {
     }
 }
 
+/// A protocol call whose answer comes to `on_result` by its number and is the caller's (a pinch's
+/// chain). `own` is told the number before the call goes out, so no answer can come before the
+/// caller knows what to look for. `false` when the call could not be sent.
+pub fn call(id: u32, method: &'static str, params: Value, own: impl FnOnce(i32)) -> bool {
+    let Some(host) = browser_of(id).and_then(|b| b.host()) else {
+        return false;
+    };
+    let Some(message_id) = with_entry(id, |e| {
+        e.next_cdp += 1;
+        e.next_cdp
+    }) else {
+        return false;
+    };
+    own(message_id);
+    crate::trace!("cdp {id}#{message_id} {method} {params}");
+    let mut dict = to_dict(&params);
+    host.execute_dev_tools_method(message_id, Some(&method.into()), Some(&mut dict)) != 0
+}
+
 /// A protocol call whose answer nobody waits for (the page's own reaction is what matters), so no
 /// job. Its number comes from the same count as the jobs', and `on_result` lets an answer it does
 /// not know go. `false` when the call could not be sent.
@@ -246,6 +265,9 @@ fn failed(message: &str) -> AgentOutput {
 
 /// The answer to a protocol call.
 pub fn on_result(id: u32, message_id: i32, success: bool, bytes: &[u8]) {
+    if crate::pinch::on_result(id, message_id, success, bytes) {
+        return;
+    }
     let Some(Some(mut job)) = with_entry(id, |e| e.jobs.remove(&message_id)) else {
         // Not a job's: a fired key, whose failure sends it again.
         if let Some(Some(key)) = with_entry(id, |e| settle_fired(&mut e.fired, message_id, success))

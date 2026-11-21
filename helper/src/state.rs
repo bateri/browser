@@ -212,6 +212,8 @@ pub struct Entry {
     /// fails the key is sent again the engine's own way (see `agent::fire`).
     pub fired: HashMap<i32, Fired>,
     pub next_cdp: i32,
+    /// The trackpad pinch that is under way ([`crate::pinch`]).
+    pub pinch: crate::pinch::Machine,
     /// The developer tools were asked for: until this time the helper brings their window to the
     /// front (the engine makes it a moment later, and a background app's windows do not come
     /// forward by themselves).
@@ -234,11 +236,19 @@ pub struct Download {
     pub cancel: Option<DownloadItemCallback>,
 }
 
+/// A context menu bateri is choosing from.
+pub struct OpenMenu {
+    pub callback: RunContextMenuCallback,
+    /// The commands the menu held: the only ones an answer may run.
+    pub offered: Vec<i32>,
+    /// Where it was asked for, in points from the view's corner (what "Inspect" looks at).
+    pub at: (i32, i32),
+}
+
 /// Answers the helper is waiting for from bateri: `(browser, ...)`.
 #[derive(Default)]
 pub struct Pending {
-    /// The callback, and the commands the menu held (the only ones an answer may run).
-    pub menus: HashMap<u32, (u32, RunContextMenuCallback, Vec<i32>)>,
+    pub menus: HashMap<u32, (u32, OpenMenu)>,
     pub dialogs: HashMap<u32, (u32, DialogKind, JsdialogCallback)>,
     pub files: HashMap<u32, (u32, FileDialogCallback)>,
     pub before_download: HashMap<u32, (u32, BeforeDownloadCallback)>,

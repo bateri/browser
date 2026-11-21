@@ -50,6 +50,15 @@ pub enum MouseKind {
     Up,
 }
 
+/// The three parts of a trackpad pinch ([`Command::Pinch`]).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PinchKind {
+    Begin,
+    Update,
+    End,
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Button {
@@ -209,6 +218,27 @@ pub enum Command {
         dy: i32,
         mods: u32,
     },
+    /// A trackpad pinch, as `magnifyWithEvent:` reports it: one `Begin`, any number of `Update`s
+    /// and one `End`. `x`, `y` are where the fingers are (points from the view's corner), `scale`
+    /// of an `Update` is the change since the one before it (1.05: the fingers spread by 5 %;
+    /// 1.0 in `Begin` and `End`).
+    ///
+    /// The page has it first, as in Chrome on a Mac: every `Update` reaches it as a `wheel` event
+    /// with `ctrlKey` set and a `deltaY` of `-100 * ln(scale)` (negative to zoom in), which a map
+    /// or a design canvas takes for its own zoom. If the page does not call `preventDefault` on
+    /// the first of them, the pinch zooms the page visually: the visual viewport scales (1 to 5;
+    /// the layout does not change, `visualViewport.scale` says how far), the point between the
+    /// fingers stays where it is, and where the page is clicked afterwards is where it was
+    /// aimed. It is not the page zoom of `Zoom` (⌘+). The zoom stays after `End` until the page
+    /// is left.
+    Pinch {
+        browser: u32,
+        kind: PinchKind,
+        x: i32,
+        y: i32,
+        #[serde(default = "no_change")]
+        scale: f64,
+    },
     /// A key. `commands` are the macOS editing commands the system's key bindings made of it
     /// (`interpretKeyEvents` then `doCommandBySelector:`, the selector's name without the colon:
     /// `moveToBeginningOfLine`, `deleteToBeginningOfLine`, `selectAll`). They go to the page with
@@ -300,6 +330,10 @@ pub enum Command {
     Quit,
 }
 
+fn no_change() -> f64 {
+    1.0
+}
+
 /// The shape of the mouse pointer the page asks for.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -353,6 +387,10 @@ pub struct MenuItem {
     pub enabled: bool,
     pub checked: bool,
     pub separator: bool,
+    /// The keys that do the same from the keyboard, as the Mac writes them in a menu (`⌘+`,
+    /// `⌥⌘I`); empty for a row that has none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub shortcut: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -531,6 +569,7 @@ impl Command {
             | Command::Focus { browser, .. }
             | Command::Mouse { browser, .. }
             | Command::Wheel { browser, .. }
+            | Command::Pinch { browser, .. }
             | Command::Key { browser, .. }
             | Command::Edit { browser, .. }
             | Command::ImeCommit { browser, .. }
@@ -564,6 +603,7 @@ impl Command {
             Command::Focus { .. } => "focus",
             Command::Mouse { .. } => "mouse",
             Command::Wheel { .. } => "wheel",
+            Command::Pinch { .. } => "pinch",
             Command::Key { .. } => "key",
             Command::Edit { .. } => "edit",
             Command::ImeCommit { .. } => "ime_commit",

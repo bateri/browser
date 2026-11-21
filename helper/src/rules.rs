@@ -130,7 +130,6 @@ pub fn profile_dir_ok(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
-/// Zoom ratios the engine is asked for are held to this range.
 /// A menu label without its mnemonic marker: the engine's labels carry the Windows convention
 /// (`&Back`, `Save &as...`, a literal ampersand written `&&`), which a Mac menu does not show.
 pub fn menu_label(label: &str) -> String {
@@ -149,8 +148,106 @@ pub fn menu_label(label: &str) -> String {
     out
 }
 
+/// Zoom ratios the engine is asked for are held to this range.
 pub const ZOOM_MIN: f64 = 0.25;
 pub const ZOOM_MAX: f64 = 5.0;
+
+/// The page zooms Chrome steps through (its own presets), 25 % to 500 %.
+const ZOOM_PRESETS: [f64; 17] = [
+    0.25,
+    1.0 / 3.0,
+    0.5,
+    2.0 / 3.0,
+    0.75,
+    0.8,
+    0.9,
+    1.0,
+    1.1,
+    1.25,
+    1.5,
+    1.75,
+    2.0,
+    2.5,
+    3.0,
+    4.0,
+    5.0,
+];
+
+/// The next of Chrome's preset zooms above `ratio` (`up`) or below it, `None` at the end of the
+/// list. A zoom between two presets (one `Command::Zoom` set) goes to the nearer one on its side.
+pub fn zoom_step(ratio: f64, up: bool) -> Option<f64> {
+    const SAME: f64 = 0.001;
+    if up {
+        ZOOM_PRESETS.into_iter().find(|p| *p > ratio + SAME)
+    } else {
+        ZOOM_PRESETS.into_iter().rev().find(|p| *p < ratio - SAME)
+    }
+}
+
+/// The rows the helper adds to the end of the page's context menu, and the numbers they answer
+/// with: the engine keeps `MENU_ID_USER_FIRST` and up for the embedder, and the helper runs these
+/// itself (`MenuResult` is answered with one of them and the engine is never asked).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnRow {
+    ZoomIn,
+    ZoomOut,
+    ActualSize,
+    Inspect,
+}
+
+/// `MENU_ID_USER_FIRST` of the engine (a test holds the two together).
+pub const OWN_FIRST: i32 = 26500;
+
+impl OwnRow {
+    pub const ALL: [OwnRow; 4] = [
+        OwnRow::ZoomIn,
+        OwnRow::ZoomOut,
+        OwnRow::ActualSize,
+        OwnRow::Inspect,
+    ];
+
+    pub fn command(self) -> i32 {
+        OWN_FIRST
+            + Self::ALL
+                .iter()
+                .position(|row| *row == self)
+                .unwrap_or_default() as i32
+    }
+
+    pub fn of(command: i32) -> Option<OwnRow> {
+        Self::ALL.into_iter().find(|row| row.command() == command)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            OwnRow::ZoomIn => "Zoom In",
+            OwnRow::ZoomOut => "Zoom Out",
+            OwnRow::ActualSize => "Actual Size",
+            OwnRow::Inspect => "Inspect",
+        }
+    }
+
+    /// The keys that do the same from the keyboard (bateri's own menu has them).
+    pub fn shortcut(self) -> &'static str {
+        match self {
+            OwnRow::ZoomIn => "⌘+",
+            OwnRow::ZoomOut => "⌘\u{2212}",
+            OwnRow::ActualSize => "⌘0",
+            OwnRow::Inspect => "⌥⌘I",
+        }
+    }
+
+    /// Whether the row can be run at a page zoom of `ratio`: the zoom rows only where they have
+    /// somewhere to go.
+    pub fn enabled(self, ratio: f64) -> bool {
+        match self {
+            OwnRow::ZoomIn => zoom_step(ratio, true).is_some(),
+            OwnRow::ZoomOut => zoom_step(ratio, false).is_some(),
+            OwnRow::ActualSize => (ratio - 1.0).abs() > 0.001,
+            OwnRow::Inspect => true,
+        }
+    }
+}
 
 /// Chromium's zoom level steps by powers of 1.2.
 pub fn ratio_to_level(ratio: f64) -> f64 {
@@ -355,6 +452,48 @@ mod tests {
         assert!((r - 2.0).abs() < 1e-9);
         assert_eq!(ratio_to_level(100.0), ratio_to_level(ZOOM_MAX));
         assert_eq!(ratio_to_level(0.0), ratio_to_level(ZOOM_MIN));
+    }
+
+    #[test]
+    fn zoom_steps_are_chromes_presets() {
+        assert_eq!(zoom_step(1.0, true), Some(1.1));
+        assert_eq!(zoom_step(1.0, false), Some(0.9));
+        assert_eq!(zoom_step(1.1, true), Some(1.25));
+        assert_eq!(zoom_step(0.9, true), Some(1.0));
+        // What the engine hands back after a round trip through its level is the same zoom.
+        let held = level_to_ratio(ratio_to_level(1.1));
+        assert_eq!(zoom_step(held, true), Some(1.25));
+        assert_eq!(zoom_step(held, false), Some(1.0));
+        // Between two presets: the one on the side asked for.
+        assert_eq!(zoom_step(1.2, true), Some(1.25));
+        assert_eq!(zoom_step(1.2, false), Some(1.1));
+        // The ends.
+        assert_eq!(zoom_step(ZOOM_MAX, true), None);
+        assert_eq!(zoom_step(ZOOM_MIN, false), None);
+        assert_eq!(zoom_step(ZOOM_MIN, true), Some(1.0 / 3.0));
+        // Every step stays inside what a zoom may be.
+        let mut at = ZOOM_MIN;
+        while let Some(next) = zoom_step(at, true) {
+            assert!((ZOOM_MIN..=ZOOM_MAX).contains(&next));
+            at = next;
+        }
+        assert_eq!(at, ZOOM_MAX);
+    }
+
+    #[test]
+    fn the_rows_the_helper_adds_have_numbers_of_their_own_in_the_embedders_range() {
+        let numbers: Vec<i32> = OwnRow::ALL.iter().map(|row| row.command()).collect();
+        assert_eq!(numbers, vec![26500, 26501, 26502, 26503]);
+        for row in OwnRow::ALL {
+            assert_eq!(OwnRow::of(row.command()), Some(row));
+        }
+        // The engine's own numbers (Back, Copy, view source) are none of theirs.
+        assert_eq!(OwnRow::of(100), None);
+        assert_eq!(OwnRow::of(26504), None);
+        assert!(OwnRow::ZoomIn.enabled(1.0) && !OwnRow::ZoomIn.enabled(ZOOM_MAX));
+        assert!(OwnRow::ZoomOut.enabled(1.0) && !OwnRow::ZoomOut.enabled(ZOOM_MIN));
+        assert!(!OwnRow::ActualSize.enabled(1.0) && OwnRow::ActualSize.enabled(1.25));
+        assert!(OwnRow::Inspect.enabled(1.0));
     }
 
     #[test]

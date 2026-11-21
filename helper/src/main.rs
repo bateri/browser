@@ -11,6 +11,7 @@ mod convert;
 mod handlers;
 mod keys;
 mod mac;
+mod pinch;
 mod rules;
 mod state;
 mod switches;

@@ -7,8 +7,8 @@
 use crate::convert::{key_event_of, mods_to_cef};
 use crate::handlers::{HelperClient, ToolsClient, observe, push_state};
 use crate::state::{
-    self, Context, Creds, Entry, FindStart, Fired, State, browser_of, emit, emit_error, take_where,
-    with, with_entry,
+    self, Context, Creds, Entry, FindStart, Fired, OpenMenu, State, browser_of, emit, emit_error,
+    take_where, with, with_entry,
 };
 use crate::{agent, keys, rules, switches, trace};
 use browser_ipc::Command;
@@ -36,14 +36,30 @@ pub fn handle(command: Command) {
         } => open(browser, profile, width, height, scale),
         Command::Close { browser } => close(browser),
         Command::MenuResult { req, command } => {
-            let Some((_, callback, offered)) = with(|s| s.pending.menus.remove(&req)) else {
+            let Some((
+                browser,
+                OpenMenu {
+                    callback,
+                    offered,
+                    at,
+                },
+            )) = with(|s| s.pending.menus.remove(&req))
+            else {
                 return;
             };
             match command {
                 // Only a command the menu held is run: the engine has more behind its other
                 // numbers (`view-source:` pages among them) than the helper ever loads.
+                //
+                // The rows the helper added are its own to run: the engine does not know them.
                 Some(id) if rules::menu_command_offered(&offered, id) => {
-                    callback.cont(id, EventFlags::from(sys::cef_event_flags_t(0)))
+                    match rules::OwnRow::of(id) {
+                        Some(row) => {
+                            callback.cancel();
+                            own_row(browser, row, at);
+                        }
+                        None => callback.cont(id, EventFlags::from(sys::cef_event_flags_t(0))),
+                    }
                 }
                 Some(id) => {
                     trace!("menu {req}: command {id} was not offered");
@@ -465,8 +481,8 @@ pub fn dismiss_all(id: u32) {
         (menus, dialogs, files, downloads)
     });
     // Outside the borrow from here on: each answer may call back into a handler.
-    for (_, (_, callback, _)) in menus {
-        callback.cancel();
+    for (_, (_, menu)) in menus {
+        menu.callback.cancel();
     }
     for (_, (_, kind, callback)) in dialogs {
         callback.cont(rules::close_answer(kind) as _, Some(&"".into()));
@@ -625,6 +641,9 @@ fn apply(id: u32, browser: &Browser, command: Command) {
                 MouseKind::Up => host.send_mouse_click_event(Some(&event), button, 1, clicks),
             });
         }
+        Command::Pinch {
+            kind, x, y, scale, ..
+        } => crate::pinch::apply(id, kind, x, y, scale),
         Command::Wheel {
             x, y, dx, dy, mods, ..
         } => {
@@ -744,24 +763,62 @@ fn apply(id: u32, browser: &Browser, command: Command) {
         }
         Command::DevTools { .. } => {
             if host.has_dev_tools() == 0 {
-                // The windows there are now are not this request's (`front_new_windows`).
-                crate::mac::note_existing_windows();
-                let mut client = ToolsClient::new(id);
-                host.show_dev_tools(
-                    Some(&WindowInfo::default()),
-                    Some(&mut client),
-                    Some(&BrowserSettings::default()),
-                    None,
-                );
-                with_entry(id, |e| {
-                    e.devtools_front = Some(Instant::now() + DEVTOOLS_FRONT)
-                });
+                show_tools(id, &host, None);
             } else {
                 host.close_dev_tools();
             }
         }
         Command::Agent { req, op, .. } => agent::start(id, req, op),
         other => trace!("not for a browser: {}", other.name()),
+    }
+}
+
+/// Opens the developer tools of a browser, looking at the element at `at` (points from the view's
+/// corner) when there is one. Where they are open already the engine looks at the element in the
+/// same window, which is brought forward.
+fn show_tools(id: u32, host: &BrowserHost, at: Option<(i32, i32)>) {
+    let open = host.has_dev_tools() != 0;
+    // The windows there are now are not this request's (`front_new_windows`).
+    crate::mac::note_existing_windows();
+    let mut client = ToolsClient::new(id);
+    match at {
+        Some((x, y)) => trace!("the developer tools of browser {id} are asked for at {x},{y}"),
+        None => trace!("the developer tools of browser {id} are asked for"),
+    }
+    let at = at.map(|(x, y)| Point { x, y });
+    host.show_dev_tools(
+        Some(&WindowInfo::default()),
+        Some(&mut client),
+        Some(&BrowserSettings::default()),
+        at.as_ref(),
+    );
+    if open {
+        // The window is there and was claimed above: it is brought forward here, not by the wait.
+        crate::mac::front_open_windows();
+    }
+    with_entry(id, |e| {
+        e.devtools_front = Some(Instant::now() + DEVTOOLS_FRONT)
+    });
+}
+
+/// A row the helper added to the context menu was picked: run here, on the browser the menu was
+/// asked for, at the point it was asked at.
+fn own_row(id: u32, row: rules::OwnRow, at: (i32, i32)) {
+    let Some(host) = browser_of(id).and_then(|b| b.host()) else {
+        return;
+    };
+    let ratio = rules::level_to_ratio(host.zoom_level());
+    let zoom = |to: Option<f64>| {
+        if let Some(to) = to {
+            host.set_zoom_level(rules::ratio_to_level(to));
+            push_state(id);
+        }
+    };
+    match row {
+        rules::OwnRow::ZoomIn => zoom(rules::zoom_step(ratio, true)),
+        rules::OwnRow::ZoomOut => zoom(rules::zoom_step(ratio, false)),
+        rules::OwnRow::ActualSize => zoom(Some(1.0)),
+        rules::OwnRow::Inspect => show_tools(id, &host, Some(at)),
     }
 }
 

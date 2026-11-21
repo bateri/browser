@@ -2618,3 +2618,288 @@ fn quitting_with_a_question_and_a_download_open_leaves_in_order() {
     assert_eq!(fake.quit(), Some(0));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+// ---- pinch, and the rows the helper adds to the page's menu ----
+
+/// A page that says what a trackpad pinch did to it through its title: how many `wheel` events it
+/// had, whether the last had `ctrlKey`, its direction, the visual viewport's scale, the layout
+/// viewport's width, where the last click was and where the last `wheel` event was. At `/?take` it calls `preventDefault` on them
+/// (a map or a design canvas does).
+const PINCH_PAGE: &str = "<title>t</title><body style='margin:0;width:3000px;height:3000px'>\
+    <script>let n=0,ctrl='-',dir='-',click='-',at='-';\
+    addEventListener('wheel',e=>{n++;ctrl=e.ctrlKey;dir=e.deltaY<0?'in':'out';\
+    at=Math.round(e.clientX)+','+Math.round(e.clientY);\
+    if(location.search=='?take')e.preventDefault()},{passive:false});\
+    addEventListener('click',e=>{click=Math.round(e.clientX)+','+Math.round(e.clientY)});\
+    setInterval(()=>{document.title='n='+n+' ctrl='+ctrl+' dir='+dir+\
+    ' s='+visualViewport.scale.toFixed(2)+' iw='+innerWidth+' click='+click+' at='+at},50)</script>";
+
+/// One field of `PINCH_PAGE`'s title.
+fn field<'a>(title: &'a str, key: &str) -> Option<&'a str> {
+    title
+        .split(' ')
+        .find_map(|part| part.strip_prefix(key)?.strip_prefix('='))
+}
+
+fn pinch(fake: &Fake, kind: PinchKind, x: i32, y: i32, scale: f64) {
+    fake.send(Command::Pinch {
+        browser: 1,
+        kind,
+        x,
+        y,
+        scale,
+    });
+}
+
+/// The fingers spread by `total` in `steps` equal parts around (200, 150), as a trackpad reports.
+fn spread(fake: &Fake, total: f64, steps: u32) {
+    pinch(fake, PinchKind::Begin, 200, 150, 1.0);
+    for _ in 0..steps {
+        pinch(
+            fake,
+            PinchKind::Update,
+            200,
+            150,
+            total.powf(1.0 / f64::from(steps)),
+        );
+    }
+    pinch(fake, PinchKind::End, 200, 150, 1.0);
+}
+
+fn pinch_page(fake: &mut Fake, query: &str) {
+    serve(fake, PINCH_PAGE);
+    fake.open(1, profile("a", None), 400, 300, 1.0);
+    fake.go(1, &format!("http://page.test/{query}"));
+    fake.send(Command::Focus {
+        browser: 1,
+        on: true,
+    });
+}
+
+#[test]
+#[ignore]
+fn a_pinch_a_page_takes_is_ctrl_wheel_events_and_nothing_else() {
+    let mut fake = Fake::start();
+    pinch_page(&mut fake, "?take");
+    spread(&fake, 2.0, 4);
+    // The page had it as a `wheel` event with `ctrlKey`, the way Chrome on a Mac gives it, and
+    // spreading the fingers is a negative `deltaY`.
+    fake.state_where(1, |s| {
+        field(&s.title, "ctrl") == Some("true") && field(&s.title, "dir") == Some("in")
+    });
+    // It called `preventDefault`: the view stays as it was, however long it is given.
+    std::thread::sleep(Duration::from_millis(800));
+    fake.forget();
+    let s = fake.state_where(1, |_| true);
+    assert_eq!(field(&s.title, "s"), Some("1.00"), "{}", s.title);
+    // The next click is where it was aimed.
+    fake.click(1, 350, 260);
+    let s = fake.state_where(1, |s| field(&s.title, "click") != Some("-"));
+    assert_eq!(field(&s.title, "click"), Some("350,260"), "{}", s.title);
+}
+
+#[test]
+#[ignore]
+fn a_pinch_a_page_does_not_take_zooms_the_view_and_clicks_land_where_aimed() {
+    let mut fake = Fake::start();
+    pinch_page(&mut fake, "");
+    // The page is told first (it does not take it), and then the view is zoomed around the
+    // fingers: the layout viewport is the width it was (it is not the page zoom of `Zoom`).
+    spread(&fake, 2.0, 4);
+    let s = fake.state_where(1, |s| field(&s.title, "s") == Some("2.00"));
+    assert_eq!(field(&s.title, "ctrl"), Some("true"), "{}", s.title);
+    assert_eq!(field(&s.title, "dir"), Some("in"), "{}", s.title);
+    assert_eq!(field(&s.title, "iw"), Some("400"), "{}", s.title);
+    assert_eq!(fake.state_where(1, |_| true).zoom, 1.0);
+    // The page point that was under the fingers, (200, 150), still is: the view's corner is at
+    // (100, 75) in the page, so the view's (350, 260) is the page's (275, 205).
+    fake.click(1, 350, 260);
+    let s = fake.state_where(1, |s| field(&s.title, "click") != Some("-"));
+    assert_eq!(field(&s.title, "click"), Some("275,205"), "{}", s.title);
+    // A second pinch goes on from there, and a pinch in goes back to the whole page.
+    spread(&fake, 0.25, 3);
+    fake.state_where(1, |s| field(&s.title, "s") == Some("1.00"));
+    fake.click(1, 350, 260);
+    fake.state_where(1, |s| field(&s.title, "click") == Some("350,260"));
+}
+
+/// Right-clicks the page's empty corner, and answers the menu with the row called `label`.
+/// Returns the menu's rows.
+fn pick(fake: &mut Fake, label: &str) -> Vec<MenuItem> {
+    fake.forget();
+    right_click(fake, 1, 300, 250);
+    let (req, items) = fake.wait(SHORT, |e| match e {
+        Event::Menu { req, items, .. } => Some((*req, items.clone())),
+        _ => None,
+    });
+    let row = items
+        .iter()
+        .find(|m| m.label == label)
+        .unwrap_or_else(|| panic!("no {label} in {items:?}"));
+    fake.send(Command::MenuResult {
+        req,
+        command: Some(row.command),
+    });
+    items
+}
+
+#[test]
+#[ignore]
+fn the_pages_menu_ends_in_zoom_rows_that_step_by_chromes_presets() {
+    let mut fake = Fake::start();
+    serve(&fake, "<title>t</title><body style='margin:0'>a page");
+    fake.open(1, profile("a", None), 400, 300, 1.0);
+    fake.go(1, "http://page.test/");
+    fake.send(Command::Focus {
+        browser: 1,
+        on: true,
+    });
+    let items = pick(&mut fake, "Zoom In");
+    // At the end of the menu, after the page's own rows: the zoom rows, a line, Inspect.
+    let tail: Vec<(&str, &str, bool)> = items[items.len() - 6..]
+        .iter()
+        .map(|m| {
+            let label = if m.separator { "--" } else { m.label.as_str() };
+            (label, m.shortcut.as_str(), m.enabled)
+        })
+        .collect();
+    assert_eq!(
+        tail,
+        vec![
+            ("--", "", false),
+            ("Zoom In", "⌘+", true),
+            ("Zoom Out", "⌘\u{2212}", true),
+            // Already at 100 %: nowhere to go.
+            ("Actual Size", "⌘0", false),
+            ("--", "", false),
+            ("Inspect", "⌥⌘I", true),
+        ],
+        "{items:?}"
+    );
+    // Chrome's presets (110, 125 %), and what the state event says is what the engine has.
+    fake.state_where(1, |s| (s.zoom - 1.1).abs() < 0.005);
+    let items = pick(&mut fake, "Zoom In");
+    assert!(
+        items.iter().any(|m| m.label == "Actual Size" && m.enabled),
+        "{items:?}"
+    );
+    fake.state_where(1, |s| (s.zoom - 1.25).abs() < 0.005);
+    pick(&mut fake, "Zoom Out");
+    fake.state_where(1, |s| (s.zoom - 1.1).abs() < 0.005);
+    pick(&mut fake, "Actual Size");
+    fake.state_where(1, |s| (s.zoom - 1.0).abs() < 0.005);
+    pick(&mut fake, "Zoom Out");
+    fake.state_where(1, |s| (s.zoom - 0.9).abs() < 0.005);
+    pick(&mut fake, "Actual Size");
+    fake.state_where(1, |s| (s.zoom - 1.0).abs() < 0.005);
+    // The row is disabled at 100 %, and an answer that names it anyway is not run.
+    fake.forget();
+    pick(&mut fake, "Actual Size");
+    let moved = fake.try_wait(Duration::from_secs(1), |e| {
+        StateView::of(e, 1).filter(|s| (s.zoom - 1.0).abs() > 0.005)
+    });
+    assert!(moved.is_none(), "{moved:?}");
+}
+
+#[test]
+#[ignore]
+fn the_inspect_row_opens_the_developer_tools_at_the_point_and_a_second_one_stays_in_the_window() {
+    // SAFETY: the test binary runs one test at a time (`--test-threads=1`), and the variable is
+    // only read by the helper process started right here.
+    unsafe { std::env::set_var("BATERI_BROWSER_TRACE", "1") };
+    let mut fake = Fake::start();
+    unsafe { std::env::remove_var("BATERI_BROWSER_TRACE") };
+    serve(
+        &fake,
+        "<title>t</title><body style='margin:0'>\
+         <h1 style='position:absolute;left:10px;top:10px;margin:0'>a heading</h1>",
+    );
+    fake.open(1, profile("a", None), 400, 300, 1.0);
+    fake.go(1, "http://page.test/");
+    fake.send(Command::Focus {
+        browser: 1,
+        on: true,
+    });
+    let on_screen = |fake: &Fake| fake.windows().iter().filter(|w| w.on_screen).count();
+    let inspect = |fake: &mut Fake, x: i32, y: i32| {
+        fake.forget();
+        right_click(fake, 1, x, y);
+        let (req, items) = fake.wait(SHORT, |e| match e {
+            Event::Menu { req, items, .. } => Some((*req, items.clone())),
+            _ => None,
+        });
+        let row = items
+            .last()
+            .filter(|m| m.label == "Inspect" && m.enabled)
+            .unwrap_or_else(|| panic!("Inspect is not the last row of {items:?}"));
+        fake.send(Command::MenuResult {
+            req,
+            command: Some(row.command),
+        });
+    };
+    assert_eq!(on_screen(&fake), 0, "{:?}", fake.windows());
+    inspect(&mut fake, 30, 25);
+    wait_until("the tools' window on screen", || on_screen(&fake) == 1);
+    // The point the menu was asked at (the heading) is the one the engine was told to look at.
+    wait_until("the helper to ask for the tools at the point", || {
+        fake.log()
+            .contains("developer tools of browser 1 are asked for at 30,25")
+    });
+    // Where they are open already the engine looks at the element in the same window.
+    let windows = fake.windows().len();
+    inspect(&mut fake, 300, 250);
+    wait_until("the second request to reach the engine", || {
+        fake.log()
+            .contains("developer tools of browser 1 are asked for at 300,250")
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(on_screen(&fake), 1, "{:?}", fake.windows());
+    assert_eq!(fake.windows().len(), windows, "{:?}", fake.windows());
+    fake.send(Command::DevTools { browser: 1 });
+    wait_until("the window off screen", || on_screen(&fake) == 0);
+}
+
+#[test]
+#[ignore]
+fn a_pinch_on_a_page_zoomed_as_a_page_is_at_the_fingers() {
+    let mut fake = Fake::start();
+    pinch_page(&mut fake, "?take");
+    // At 200 % a point of the view is half as far from the corner in the page's own pixels: the
+    // page hears the pinch where the fingers are, not twice as far.
+    fake.send(Command::Zoom {
+        browser: 1,
+        ratio: 2.0,
+    });
+    fake.state_where(1, |s| (s.zoom - 2.0).abs() < 0.01);
+    pinch(&fake, PinchKind::Begin, 200, 100, 1.0);
+    pinch(&fake, PinchKind::Update, 200, 100, 1.1);
+    pinch(&fake, PinchKind::End, 200, 100, 1.0);
+    let s = fake.state_where(1, |s| field(&s.title, "at").is_some_and(|at| at != "-"));
+    assert_eq!(field(&s.title, "at"), Some("100,50"), "{}", s.title);
+}
+
+#[test]
+#[ignore]
+fn a_pinch_zoom_on_a_page_zoomed_as_a_page_keeps_the_point_under_the_fingers() {
+    let mut fake = Fake::start();
+    pinch_page(&mut fake, "");
+    fake.send(Command::Zoom {
+        browser: 1,
+        ratio: 2.0,
+    });
+    fake.state_where(1, |s| (s.zoom - 2.0).abs() < 0.01);
+    spread(&fake, 2.0, 2);
+    fake.state_where(1, |s| field(&s.title, "s") == Some("2.00"));
+    // The view is 200 x 150 of the page's own pixels now, and the point of it that was under
+    // (200, 150) is (100, 75) of them: the view's (350, 260) is the page's (50 + 87.5, 37.5 + 65).
+    fake.click(1, 350, 260);
+    let s = fake.state_where(1, |s| field(&s.title, "click") != Some("-"));
+    let click = field(&s.title, "click").unwrap_or("");
+    let (x, y) = click.split_once(',').unwrap_or(("", ""));
+    let (x, y): (f64, f64) = (x.parse().unwrap_or(-1.0), y.parse().unwrap_or(-1.0));
+    assert!(
+        (x - 137.5).abs() <= 1.0 && (y - 102.5).abs() <= 1.0,
+        "{}",
+        s.title
+    );
+}
