@@ -687,30 +687,47 @@ wrap_context_menu_handler! {
                 callback.cancel();
                 return 1;
             }
-            // Zoom and Inspect at the end, as they are the browser's own and not the page's: the
-            // helper runs them (`MenuResult`).
+            let windows = with_entry(self.id, |e| e.new_windows).unwrap_or_default();
+            let own = |row: rules::OwnRow, enabled: bool| MenuItem {
+                command: row.command(),
+                label: row.label(windows).into(),
+                enabled,
+                checked: false,
+                separator: false,
+                shortcut: row.shortcut().into(),
+            };
+            // A link's rows, then an image's, at the start: what the page's own element can do comes
+            // before the engine's rows. The helper runs them (`MenuResult`).
+            let urls = rules::MenuUrls {
+                open_link: userfree(params.link_url()),
+                copy_link: userfree(params.unfiltered_link_url()),
+                image: if params.media_type().get_raw() == ContextMenuMediaType::IMAGE.get_raw() {
+                    userfree(params.source_url())
+                } else {
+                    String::new()
+                },
+            };
+            let mut front = Vec::new();
+            for group in urls.groups() {
+                front.extend(group.into_iter().map(|row| own(row, true)));
+                front.push(separator());
+            }
+            items.splice(0..0, front);
+            // Zoom and Inspect at the end, as they are the browser's own and not the page's.
             let ratio = browser
                 .and_then(|b| b.host())
                 .map_or(1.0, |h| level_to_ratio(h.zoom_level()));
             items.push(separator());
-            for row in rules::OwnRow::ALL {
-                if row == rules::OwnRow::Inspect {
-                    items.push(separator());
-                }
-                items.push(MenuItem {
-                    command: row.command(),
-                    label: row.label().into(),
-                    enabled: row.enabled(ratio),
-                    checked: false,
-                    separator: false,
-                    shortcut: row.shortcut().into(),
-                });
+            for row in [rules::OwnRow::ZoomIn, rules::OwnRow::ZoomOut, rules::OwnRow::ActualSize] {
+                items.push(own(row, row.enabled(ratio)));
             }
+            items.push(separator());
+            items.push(own(rules::OwnRow::Inspect, true));
             let non_empty = |s: String| (!s.is_empty()).then_some(s);
             let req = next_req();
             let offered: Vec<i32> = items.iter().filter(|m| !m.separator && m.enabled).map(|m| m.command).collect();
             let at = (params.xcoord(), params.ycoord());
-            let menu = OpenMenu { callback: callback.clone(), offered, at };
+            let menu = OpenMenu { callback: callback.clone(), offered, at, urls };
             let stale = with(|s| s.pending.menus.insert(req, (self.id, menu)));
             drop(stale);
             emit(Event::Menu {

@@ -50,6 +50,18 @@ pub enum MouseKind {
     Up,
 }
 
+/// What a link or an image the page's menu opens becomes on bateri's side: a tab of the page
+/// (`Page`), or the same browser going there (`Here`). The helper asks for a window the same way
+/// in both (`Event::Window`); what it needs to know is the words of the menu row, "Open Link in New
+/// Tab" or "Open Link".
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NewWindows {
+    #[default]
+    Page,
+    Here,
+}
+
 /// The three parts of a trackpad pinch ([`Command::Pinch`]).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -217,6 +229,12 @@ pub enum Command {
         dx: i32,
         dy: i32,
         mods: u32,
+    },
+    /// How bateri takes a window the page or its menu asks for (`Event::Window`). Until it is said
+    /// the helper words the menu for `NewWindows::Page`; say it again when it changes.
+    Windows {
+        browser: u32,
+        mode: NewWindows,
     },
     /// A trackpad pinch, as `magnifyWithEvent:` reports it: one `Begin`, any number of `Update`s
     /// and one `End`. `x`, `y` are where the fingers are (points from the view's corner), `scale`
@@ -493,6 +511,12 @@ pub enum Event {
         kind: KeyKind,
         key: KeyData,
     },
+    /// A context menu. Rows of the helper's own are among the engine's: for a link "Open Link in
+    /// New Tab" and "Copy Link Address", for an image "Open Image in New Tab" and "Copy Image
+    /// Address" (each group first, then a separator), and at the end the zoom rows and Inspect
+    /// (`MenuItem::shortcut` carries their keys). `MenuResult` answers with the number of a row;
+    /// the helper runs its own, so what a row opens goes back as `Event::Window` with
+    /// `background` set, wherever bateri puts it (`Command::Windows`).
     Menu {
         browser: u32,
         req: u32,
@@ -569,6 +593,7 @@ impl Command {
             | Command::Focus { browser, .. }
             | Command::Mouse { browser, .. }
             | Command::Wheel { browser, .. }
+            | Command::Windows { browser, .. }
             | Command::Pinch { browser, .. }
             | Command::Key { browser, .. }
             | Command::Edit { browser, .. }
@@ -603,6 +628,7 @@ impl Command {
             Command::Focus { .. } => "focus",
             Command::Mouse { .. } => "mouse",
             Command::Wheel { .. } => "wheel",
+            Command::Windows { .. } => "windows",
             Command::Pinch { .. } => "pinch",
             Command::Key { .. } => "key",
             Command::Edit { .. } => "edit",

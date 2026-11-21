@@ -205,6 +205,22 @@ pub fn front_new_windows() -> usize {
     shown
 }
 
+/// Puts `text` on the system pasteboard as the only thing on it (what the menu's "Copy Link
+/// Address" does). Main thread only; `false` when it is not, or the pasteboard refused.
+pub fn copy_text(text: &str) -> bool {
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+    use objc2_foundation::NSString;
+    if MainThreadMarker::new().is_none() {
+        return false;
+    }
+    let board = NSPasteboard::generalPasteboard();
+    board.clearContents();
+    // SAFETY: `NSPasteboardTypeString` is a constant `NSString` of AppKit's, valid for the
+    // process's life.
+    let kind = unsafe { NSPasteboardTypeString };
+    board.setString_forType(&NSString::from_str(text), kind)
+}
+
 /// Brings the windows that are on screen (the developer tools', the helper has no others) to the
 /// front, and the helper in front of the other apps: the tools asked to look at another element
 /// are already open, and their window may be behind whatever the person is looking at.

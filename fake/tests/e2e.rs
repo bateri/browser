@@ -2903,3 +2903,193 @@ fn a_pinch_zoom_on_a_page_zoomed_as_a_page_keeps_the_point_under_the_fingers() {
         s.title
     );
 }
+
+// ---- the rows of a link and of an image in the page's menu ----
+
+/// A one pixel PNG as an address: an image the helper may open (`data:`).
+const PIXEL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+/// A page with a link, an image, an image that is a link, and two links the helper does not load.
+fn links_page(fake: &mut Fake) {
+    let html = format!(
+        "<title>t</title><body style='margin:0'>\
+         <a href='http://other.test/target' style='position:absolute;left:10px;top:10px;font-size:30px'>a link</a>\
+         <img style='position:absolute;left:10px;top:100px;width:50px;height:50px' src='{PIXEL}'>\
+         <a href='http://other.test/img' style='position:absolute;left:100px;top:100px'><img style='width:50px;height:50px' src='{PIXEL}'></a>\
+         <a href='mailto:x@y.test' style='position:absolute;left:10px;top:200px;font-size:30px'>mail</a>\
+         <a href='javascript:void(0)' style='position:absolute;left:200px;top:200px;font-size:30px'>script</a>"
+    );
+    fake.proxy.respond(move |_| Reply::html(&html));
+    fake.open(1, profile("a", None), 400, 300, 1.0);
+    fake.go(1, "http://page.test/");
+    fake.send(Command::Focus {
+        browser: 1,
+        on: true,
+    });
+}
+
+/// Right-clicks (`x`, `y`) and returns the menu that comes: its request number and its rows, as
+/// their labels (`--` for a line).
+fn menu_over(fake: &mut Fake, x: i32, y: i32) -> (u32, Vec<MenuItem>) {
+    fake.forget();
+    right_click(fake, 1, x, y);
+    fake.wait(SHORT, |e| match e {
+        Event::Menu { req, items, .. } => Some((*req, items.clone())),
+        _ => None,
+    })
+}
+
+fn labels(items: &[MenuItem]) -> Vec<&str> {
+    items
+        .iter()
+        .map(|m| if m.separator { "--" } else { m.label.as_str() })
+        .collect()
+}
+
+fn pick_row(fake: &Fake, req: u32, items: &[MenuItem], label: &str) {
+    let row = items
+        .iter()
+        .find(|m| m.label == label && m.enabled)
+        .unwrap_or_else(|| panic!("no {label} in {:?}", labels(items)));
+    fake.send(Command::MenuResult {
+        req,
+        command: Some(row.command),
+    });
+}
+
+#[test]
+#[ignore]
+fn a_links_menu_starts_with_the_rows_that_open_it_in_the_background_and_copy_its_address() {
+    let mut fake = Fake::start();
+    links_page(&mut fake);
+    let board = Pasteboard::take();
+    let (req, items) = menu_over(&mut fake, 30, 30);
+    assert_eq!(
+        labels(&items)[..3],
+        ["Open Link in New Tab", "Copy Link Address", "--"],
+        "{:?}",
+        labels(&items)
+    );
+    // The engine's own rows follow, and the helper's zoom and Inspect are at the end as before.
+    assert!(
+        items[3..].iter().any(|m| m.label == "Copy"),
+        "{:?}",
+        labels(&items)
+    );
+    assert_eq!(labels(&items).last(), Some(&"Inspect"));
+    // Opening it is a request to bateri for a window, in the background, and nothing is loaded here.
+    pick_row(&fake, req, &items, "Open Link in New Tab");
+    let (url, background) = fake.wait(SHORT, |e| match e {
+        Event::Window {
+            url, background, ..
+        } => Some((url.clone(), *background)),
+        _ => None,
+    });
+    assert_eq!(
+        (url.as_str(), background),
+        ("http://other.test/target", true)
+    );
+    // Where bateri opens a link in the browser itself the row says so, and asks the same way.
+    fake.send(Command::Windows {
+        browser: 1,
+        mode: NewWindows::Here,
+    });
+    let (req, items) = menu_over(&mut fake, 30, 30);
+    assert_eq!(
+        labels(&items)[..2],
+        ["Open Link", "Copy Link Address"],
+        "{:?}",
+        labels(&items)
+    );
+    pick_row(&fake, req, &items, "Open Link");
+    let url = fake.wait(SHORT, |e| match e {
+        Event::Window {
+            url,
+            background: true,
+            ..
+        } => Some(url.clone()),
+        _ => None,
+    });
+    assert_eq!(url, "http://other.test/target");
+    // Copying writes the address as the page wrote it to the system pasteboard.
+    board.set("before");
+    let (req, items) = menu_over(&mut fake, 30, 30);
+    pick_row(&fake, req, &items, "Copy Link Address");
+    wait_until("the address on the pasteboard", || {
+        board.text() == "http://other.test/target"
+    });
+}
+
+#[test]
+#[ignore]
+fn a_link_the_helper_does_not_load_is_copied_and_not_opened() {
+    let mut fake = Fake::start();
+    links_page(&mut fake);
+    let board = Pasteboard::take();
+    for (x, y, address) in [
+        (30, 220, "mailto:x@y.test"),
+        (230, 220, "javascript:void(0)"),
+    ] {
+        let (req, items) = menu_over(&mut fake, x, y);
+        let rows = labels(&items);
+        assert!(
+            !rows.iter().any(|l| l.starts_with("Open Link")),
+            "{address}: {rows:?}"
+        );
+        assert_eq!(rows[0], "Copy Link Address", "{address}: {rows:?}");
+        board.set("before");
+        fake.forget();
+        pick_row(&fake, req, &items, "Copy Link Address");
+        wait_until("the address on the pasteboard", || board.text() == address);
+    }
+    // Nobody was asked for a window, or refused one.
+    let stray = fake.try_wait(Duration::from_secs(1), |e| match e {
+        Event::Window { .. } | Event::Refused { .. } => Some(format!("{e:?}")),
+        _ => None,
+    });
+    assert_eq!(stray, None);
+}
+
+#[test]
+#[ignore]
+fn an_images_menu_starts_with_the_rows_that_open_it_in_the_background_and_copy_its_address() {
+    let mut fake = Fake::start();
+    links_page(&mut fake);
+    let board = Pasteboard::take();
+    let (req, items) = menu_over(&mut fake, 30, 120);
+    assert_eq!(
+        labels(&items)[..3],
+        ["Open Image in New Tab", "Copy Image Address", "--"],
+        "{:?}",
+        labels(&items)
+    );
+    pick_row(&fake, req, &items, "Open Image in New Tab");
+    let (url, background) = fake.wait(SHORT, |e| match e {
+        Event::Window {
+            url, background, ..
+        } => Some((url.clone(), *background)),
+        _ => None,
+    });
+    assert_eq!((url.as_str(), background), (PIXEL, true));
+    board.set("before");
+    let (req, items) = menu_over(&mut fake, 30, 120);
+    pick_row(&fake, req, &items, "Copy Image Address");
+    wait_until("the address on the pasteboard", || board.text() == PIXEL);
+    // An image that is a link has the link's rows first, and then its own.
+    let (req, items) = menu_over(&mut fake, 120, 120);
+    assert_eq!(
+        labels(&items)[..6],
+        [
+            "Open Link in New Tab",
+            "Copy Link Address",
+            "--",
+            "Open Image in New Tab",
+            "Copy Image Address",
+            "--"
+        ],
+        "{:?}",
+        labels(&items)
+    );
+    // Dismissed, it answers nothing.
+    fake.send(Command::MenuResult { req, command: None });
+}

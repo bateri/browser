@@ -42,6 +42,7 @@ pub fn handle(command: Command) {
                     callback,
                     offered,
                     at,
+                    urls,
                 },
             )) = with(|s| s.pending.menus.remove(&req))
             else {
@@ -56,7 +57,7 @@ pub fn handle(command: Command) {
                     match rules::OwnRow::of(id) {
                         Some(row) => {
                             callback.cancel();
-                            own_row(browser, row, at);
+                            own_row(browser, row, at, &urls);
                         }
                         None => callback.cont(id, EventFlags::from(sys::cef_event_flags_t(0))),
                     }
@@ -641,6 +642,9 @@ fn apply(id: u32, browser: &Browser, command: Command) {
                 MouseKind::Up => host.send_mouse_click_event(Some(&event), button, 1, clicks),
             });
         }
+        Command::Windows { mode, .. } => {
+            with_entry(id, |e| e.new_windows = mode);
+        }
         Command::Pinch {
             kind, x, y, scale, ..
         } => crate::pinch::apply(id, kind, x, y, scale),
@@ -802,8 +806,8 @@ fn show_tools(id: u32, host: &BrowserHost, at: Option<(i32, i32)>) {
 }
 
 /// A row the helper added to the context menu was picked: run here, on the browser the menu was
-/// asked for, at the point it was asked at.
-fn own_row(id: u32, row: rules::OwnRow, at: (i32, i32)) {
+/// asked for, at the point it was asked at and for the link and image it was asked for.
+fn own_row(id: u32, row: rules::OwnRow, at: (i32, i32), urls: &rules::MenuUrls) {
     let Some(host) = browser_of(id).and_then(|b| b.host()) else {
         return;
     };
@@ -819,6 +823,21 @@ fn own_row(id: u32, row: rules::OwnRow, at: (i32, i32)) {
         rules::OwnRow::ZoomOut => zoom(rules::zoom_step(ratio, false)),
         rules::OwnRow::ActualSize => zoom(Some(1.0)),
         rules::OwnRow::Inspect => show_tools(id, &host, Some(at)),
+        // What opens is asked of bateri as a window in the background, the way a page's own link
+        // that wants one is (`rules::window_event` refuses an address the helper does not load);
+        // what copies goes to the system pasteboard.
+        rules::OwnRow::OpenLink | rules::OwnRow::OpenImage => {
+            if let Some(url) = urls.of(row) {
+                emit(rules::window_event(id, url, true));
+            }
+        }
+        rules::OwnRow::CopyLink | rules::OwnRow::CopyImage => {
+            if let Some(url) = urls.of(row)
+                && !crate::mac::copy_text(url)
+            {
+                trace!("browser {id}: the address was not put on the pasteboard");
+            }
+        }
     }
 }
 

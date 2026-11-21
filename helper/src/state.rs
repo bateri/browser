@@ -212,6 +212,9 @@ pub struct Entry {
     /// fails the key is sent again the engine's own way (see `agent::fire`).
     pub fired: HashMap<i32, Fired>,
     pub next_cdp: i32,
+    /// How bateri takes a window the browser's menu asks for (`Command::Windows`): the words of
+    /// the rows that open.
+    pub new_windows: browser_ipc::message::NewWindows,
     /// The trackpad pinch that is under way ([`crate::pinch`]).
     pub pinch: crate::pinch::Machine,
     /// The developer tools were asked for: until this time the helper brings their window to the
@@ -243,6 +246,8 @@ pub struct OpenMenu {
     pub offered: Vec<i32>,
     /// Where it was asked for, in points from the view's corner (what "Inspect" looks at).
     pub at: (i32, i32),
+    /// The addresses of the link and of the image it was asked for (what their rows work on).
+    pub urls: crate::rules::MenuUrls,
 }
 
 /// Answers the helper is waiting for from bateri: `(browser, ...)`.

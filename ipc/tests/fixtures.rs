@@ -81,6 +81,10 @@ fn commands() -> Vec<Command> {
             dy: -120,
             mods: 0,
         },
+        Command::Windows {
+            browser: 1,
+            mode: NewWindows::Here,
+        },
         Command::Pinch {
             browser: 1,
             kind: PinchKind::Update,

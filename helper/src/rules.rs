@@ -2,6 +2,8 @@
 //! called, how a zoom ratio maps to Chromium's zoom level. No engine in here, so they are tested
 //! without one.
 
+use browser_ipc::message::NewWindows;
+
 /// The longest address the helper takes.
 pub const MAX_ADDRESS: usize = 8192;
 
@@ -184,26 +186,36 @@ pub fn zoom_step(ratio: f64, up: bool) -> Option<f64> {
     }
 }
 
-/// The rows the helper adds to the end of the page's context menu, and the numbers they answer
-/// with: the engine keeps `MENU_ID_USER_FIRST` and up for the embedder, and the helper runs these
-/// itself (`MenuResult` is answered with one of them and the engine is never asked).
+/// The rows the helper adds to the page's context menu, and the numbers they answer with: the
+/// engine keeps `MENU_ID_USER_FIRST` and up for the embedder, and the helper runs these itself
+/// (`MenuResult` is answered with one of them and the engine is never asked). The zoom rows and
+/// Inspect go at the end; the rows of a link and of an image at the start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwnRow {
     ZoomIn,
     ZoomOut,
     ActualSize,
     Inspect,
+    OpenLink,
+    CopyLink,
+    OpenImage,
+    CopyImage,
 }
 
 /// `MENU_ID_USER_FIRST` of the engine (a test holds the two together).
 pub const OWN_FIRST: i32 = 26500;
 
 impl OwnRow {
-    pub const ALL: [OwnRow; 4] = [
+    /// In the order of their numbers: a new row goes last, so that no number moves.
+    pub const ALL: [OwnRow; 8] = [
         OwnRow::ZoomIn,
         OwnRow::ZoomOut,
         OwnRow::ActualSize,
         OwnRow::Inspect,
+        OwnRow::OpenLink,
+        OwnRow::CopyLink,
+        OwnRow::OpenImage,
+        OwnRow::CopyImage,
     ];
 
     pub fn command(self) -> i32 {
@@ -218,22 +230,32 @@ impl OwnRow {
         Self::ALL.into_iter().find(|row| row.command() == command)
     }
 
-    pub fn label(self) -> &'static str {
-        match self {
-            OwnRow::ZoomIn => "Zoom In",
-            OwnRow::ZoomOut => "Zoom Out",
-            OwnRow::ActualSize => "Actual Size",
-            OwnRow::Inspect => "Inspect",
+    /// The words of the row. What opens is "in New Tab" where bateri opens a tab for it, and plain
+    /// where the browser goes there itself.
+    pub fn label(self, windows: NewWindows) -> &'static str {
+        match (self, windows) {
+            (OwnRow::ZoomIn, _) => "Zoom In",
+            (OwnRow::ZoomOut, _) => "Zoom Out",
+            (OwnRow::ActualSize, _) => "Actual Size",
+            (OwnRow::Inspect, _) => "Inspect",
+            (OwnRow::OpenLink, NewWindows::Page) => "Open Link in New Tab",
+            (OwnRow::OpenLink, NewWindows::Here) => "Open Link",
+            (OwnRow::CopyLink, _) => "Copy Link Address",
+            (OwnRow::OpenImage, NewWindows::Page) => "Open Image in New Tab",
+            (OwnRow::OpenImage, NewWindows::Here) => "Open Image",
+            (OwnRow::CopyImage, _) => "Copy Image Address",
         }
     }
 
-    /// The keys that do the same from the keyboard (bateri's own menu has them).
+    /// The keys that do the same from the keyboard (bateri's own menu has them); none for the rows
+    /// that have none.
     pub fn shortcut(self) -> &'static str {
         match self {
             OwnRow::ZoomIn => "⌘+",
             OwnRow::ZoomOut => "⌘\u{2212}",
             OwnRow::ActualSize => "⌘0",
             OwnRow::Inspect => "⌥⌘I",
+            _ => "",
         }
     }
 
@@ -244,8 +266,67 @@ impl OwnRow {
             OwnRow::ZoomIn => zoom_step(ratio, true).is_some(),
             OwnRow::ZoomOut => zoom_step(ratio, false).is_some(),
             OwnRow::ActualSize => (ratio - 1.0).abs() > 0.001,
-            OwnRow::Inspect => true,
+            _ => true,
         }
+    }
+}
+
+/// What a menu was asked for: the addresses the rows of a link and of an image work on.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MenuUrls {
+    /// The link under the pointer as the engine vouches for it: what is opened.
+    pub open_link: String,
+    /// The link as the page wrote it: what is copied.
+    pub copy_link: String,
+    /// The address of the image under the pointer; empty where the element is no image.
+    pub image: String,
+}
+
+impl MenuUrls {
+    /// The groups of rows that start the menu, each followed by a line: a link's, then an image's.
+    /// A row that opens is there only for an address the helper loads (`check_address`: a link to
+    /// anything else would be refused as the window it asks for), and for a link only if the page's
+    /// own address is one too: the engine puts `about:blank#blocked` in the place of a `javascript:`
+    /// link it will not vouch for, and that is no link to open. A row that copies is there for any
+    /// address, since what it does is write the text.
+    pub fn groups(&self) -> Vec<Vec<OwnRow>> {
+        let group = |open: &str, copy: &str, rows: [OwnRow; 2]| {
+            let mut group = Vec::new();
+            if check_address(open).is_ok() && check_address(copy).is_ok() {
+                group.push(rows[0]);
+            }
+            if !copy.is_empty() {
+                group.push(rows[1]);
+            }
+            group
+        };
+        [
+            group(
+                &self.open_link,
+                &self.copy_link,
+                [OwnRow::OpenLink, OwnRow::CopyLink],
+            ),
+            group(
+                &self.image,
+                &self.image,
+                [OwnRow::OpenImage, OwnRow::CopyImage],
+            ),
+        ]
+        .into_iter()
+        .filter(|rows| !rows.is_empty())
+        .collect()
+    }
+
+    /// The address a row of a link or of an image works on.
+    pub fn of(&self, row: OwnRow) -> Option<&str> {
+        match row {
+            OwnRow::OpenLink => Some(&self.open_link),
+            OwnRow::CopyLink => Some(&self.copy_link),
+            OwnRow::OpenImage | OwnRow::CopyImage => Some(&self.image),
+            _ => None,
+        }
+        .map(String::as_str)
+        .filter(|url| !url.is_empty())
     }
 }
 
@@ -483,17 +564,129 @@ mod tests {
     #[test]
     fn the_rows_the_helper_adds_have_numbers_of_their_own_in_the_embedders_range() {
         let numbers: Vec<i32> = OwnRow::ALL.iter().map(|row| row.command()).collect();
-        assert_eq!(numbers, vec![26500, 26501, 26502, 26503]);
+        // The first four are the ones that went out first: a number does not move.
+        assert_eq!(
+            numbers,
+            vec![26500, 26501, 26502, 26503, 26504, 26505, 26506, 26507]
+        );
         for row in OwnRow::ALL {
             assert_eq!(OwnRow::of(row.command()), Some(row));
         }
         // The engine's own numbers (Back, Copy, view source) are none of theirs.
         assert_eq!(OwnRow::of(100), None);
-        assert_eq!(OwnRow::of(26504), None);
+        assert_eq!(OwnRow::of(26508), None);
         assert!(OwnRow::ZoomIn.enabled(1.0) && !OwnRow::ZoomIn.enabled(ZOOM_MAX));
         assert!(OwnRow::ZoomOut.enabled(1.0) && !OwnRow::ZoomOut.enabled(ZOOM_MIN));
         assert!(!OwnRow::ActualSize.enabled(1.0) && OwnRow::ActualSize.enabled(1.25));
         assert!(OwnRow::Inspect.enabled(1.0));
+    }
+
+    #[test]
+    fn what_a_row_opens_is_worded_by_where_bateri_opens_it() {
+        assert_eq!(
+            OwnRow::OpenLink.label(NewWindows::Page),
+            "Open Link in New Tab"
+        );
+        assert_eq!(OwnRow::OpenLink.label(NewWindows::Here), "Open Link");
+        assert_eq!(
+            OwnRow::OpenImage.label(NewWindows::Page),
+            "Open Image in New Tab"
+        );
+        assert_eq!(OwnRow::OpenImage.label(NewWindows::Here), "Open Image");
+        // What copies says the same either way, and none of them has keys.
+        for windows in [NewWindows::Page, NewWindows::Here] {
+            assert_eq!(OwnRow::CopyLink.label(windows), "Copy Link Address");
+            assert_eq!(OwnRow::CopyImage.label(windows), "Copy Image Address");
+        }
+        assert!(OwnRow::OpenLink.shortcut().is_empty() && OwnRow::CopyImage.shortcut().is_empty());
+    }
+
+    fn urls(link: &str, copy: &str, image: &str) -> MenuUrls {
+        MenuUrls {
+            open_link: link.into(),
+            copy_link: copy.into(),
+            image: image.into(),
+        }
+    }
+
+    #[test]
+    fn a_link_and_an_image_each_start_the_menu_with_a_group_of_rows() {
+        use OwnRow::*;
+        assert_eq!(
+            urls("http://a.test/x", "http://a.test/x", "").groups(),
+            vec![vec![OpenLink, CopyLink]]
+        );
+        assert_eq!(
+            urls("", "", "data:image/png;base64,AAAA").groups(),
+            vec![vec![OpenImage, CopyImage]]
+        );
+        // An image in a link: the link's rows first.
+        assert_eq!(
+            urls("https://a.test/", "https://a.test/", "https://a.test/i.png").groups(),
+            vec![vec![OpenLink, CopyLink], vec![OpenImage, CopyImage]]
+        );
+        // Neither: the engine's menu as it is.
+        assert!(urls("", "", "").groups().is_empty());
+    }
+
+    #[test]
+    fn a_row_that_opens_is_there_only_for_an_address_the_helper_loads() {
+        use OwnRow::*;
+        // The four schemes it loads.
+        for url in [
+            "http://a.test/",
+            "https://a.test/",
+            "data:text/html,hi",
+            "about:blank",
+        ] {
+            assert_eq!(
+                urls(url, url, "").groups(),
+                vec![vec![OpenLink, CopyLink]],
+                "{url}"
+            );
+        }
+        // Anything else is copied, and not opened.
+        for url in [
+            "mailto:a@b.test",
+            "javascript:void(0)",
+            "file:///etc/passwd",
+            "ftp://a.test/",
+        ] {
+            assert_eq!(urls(url, url, "").groups(), vec![vec![CopyLink]], "{url}");
+            assert_eq!(urls("", url, "").groups(), vec![vec![CopyLink]], "{url}");
+        }
+        // What the engine puts in the place of a link it will not vouch for is not opened, and the
+        // address the page wrote is still copied.
+        assert_eq!(
+            urls("about:blank#blocked", "javascript:void(0)", "").groups(),
+            vec![vec![CopyLink]]
+        );
+        // One that is too long or is not plain ASCII is no address to open either.
+        let long = format!("http://a.test/{}", "x".repeat(MAX_ADDRESS));
+        assert_eq!(urls(&long, &long, "").groups(), vec![vec![CopyLink]]);
+        assert_eq!(
+            urls("http://a.test/ü", "http://a.test/ü", "").groups(),
+            vec![vec![CopyLink]]
+        );
+        assert_eq!(
+            urls("", "", "ftp://a.test/i.png").groups(),
+            vec![vec![CopyImage]]
+        );
+    }
+
+    #[test]
+    fn a_row_works_on_its_own_address() {
+        let u = urls(
+            "http://open.test/",
+            "http://copy.test/",
+            "http://image.test/",
+        );
+        assert_eq!(u.of(OwnRow::OpenLink), Some("http://open.test/"));
+        assert_eq!(u.of(OwnRow::CopyLink), Some("http://copy.test/"));
+        assert_eq!(u.of(OwnRow::OpenImage), Some("http://image.test/"));
+        assert_eq!(u.of(OwnRow::CopyImage), Some("http://image.test/"));
+        assert_eq!(u.of(OwnRow::ZoomIn), None);
+        assert_eq!(urls("", "", "").of(OwnRow::OpenLink), None);
     }
 
     #[test]
