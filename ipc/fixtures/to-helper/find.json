@@ -1,0 +1,8 @@
+{
+  "t": "find",
+  "browser": 1,
+  "pattern": "needle",
+  "case": false,
+  "forward": true,
+  "next": false
+}

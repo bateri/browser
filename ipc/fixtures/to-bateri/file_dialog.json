@@ -1,0 +1,12 @@
+{
+  "e": "file_dialog",
+  "browser": 1,
+  "req": 5,
+  "mode": "open_multiple",
+  "title": "Choose",
+  "default_path": "",
+  "accept": [
+    ".csv",
+    "image/png"
+  ]
+}

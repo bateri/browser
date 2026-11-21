@@ -1,0 +1,9 @@
+{
+  "e": "download",
+  "browser": 1,
+  "req": 6,
+  "url": "http://a.test/r.csv",
+  "name": "r.csv",
+  "mime": "text/csv",
+  "size": 2048
+}

@@ -1,0 +1,9 @@
+{
+  "e": "dialog",
+  "browser": 1,
+  "req": 4,
+  "kind": "prompt",
+  "origin": "http://a.test",
+  "message": "Name?",
+  "default_text": "x"
+}

@@ -1,0 +1,13 @@
+{
+  "t": "key",
+  "browser": 1,
+  "kind": "down",
+  "key": {
+    "vk": 37,
+    "native": 123,
+    "character": 63234,
+    "unmodified": 63234,
+    "mods": 8,
+    "system": true
+  }
+}

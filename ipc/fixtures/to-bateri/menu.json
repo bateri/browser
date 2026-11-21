@@ -1,0 +1,27 @@
+{
+  "e": "menu",
+  "browser": 1,
+  "req": 3,
+  "x": 5,
+  "y": 6,
+  "items": [
+    {
+      "command": 11,
+      "label": "Back",
+      "enabled": false,
+      "checked": false,
+      "separator": false
+    },
+    {
+      "command": 0,
+      "label": "",
+      "enabled": false,
+      "checked": false,
+      "separator": true
+    }
+  ],
+  "link": "http://a.test/",
+  "source": null,
+  "selection": "words",
+  "editable": false
+}

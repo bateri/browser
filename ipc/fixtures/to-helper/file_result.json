@@ -1,0 +1,7 @@
+{
+  "t": "file_result",
+  "req": 5,
+  "paths": [
+    "/tmp/a.csv"
+  ]
+}

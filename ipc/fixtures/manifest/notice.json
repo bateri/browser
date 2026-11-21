@@ -1,0 +1,15 @@
+{
+  "format": 1,
+  "version": "0.1.0",
+  "chromium": "156.0.7871.0",
+  "protocol": 1,
+  "minimum": "0.1.0",
+  "assets": [
+    {
+      "arch": "arm64",
+      "name": "bateri-browser-0.1.0-arm64.zip",
+      "size": 123456789,
+      "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    }
+  ]
+}

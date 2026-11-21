@@ -1,0 +1,12 @@
+{
+  "t": "agent",
+  "browser": 1,
+  "req": 9,
+  "op": {
+    "op": "click",
+    "target": {
+      "kind": "node",
+      "id": 12
+    }
+  }
+}

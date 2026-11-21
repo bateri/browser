@@ -1,0 +1,18 @@
+[package]
+name = "browser-fake"
+description = "A stand-in for bateri that drives the helper in tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+browser-ipc = { path = "../ipc" }
+serde_json = "1"
+libc = "0.2"
+base64 = "0.22"
+
+[dev-dependencies]
+browser-ipc = { path = "../ipc", features = ["wgpu"] }
+pollster = "0.4"

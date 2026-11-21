@@ -1,0 +1,13 @@
+{
+  "t": "open",
+  "browser": 1,
+  "profile": {
+    "context": "mac/app/work",
+    "dir": "0123abcd",
+    "user": "u-7",
+    "pass": "p-7"
+  },
+  "width": 800,
+  "height": 600,
+  "scale": 2.0
+}

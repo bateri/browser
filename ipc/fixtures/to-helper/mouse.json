@@ -1,0 +1,10 @@
+{
+  "t": "mouse",
+  "browser": 1,
+  "kind": "down",
+  "x": 10,
+  "y": 20,
+  "button": "right",
+  "clicks": 1,
+  "mods": 129
+}

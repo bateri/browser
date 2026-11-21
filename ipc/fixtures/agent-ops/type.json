@@ -1,0 +1,9 @@
+{
+  "op": "type",
+  "text": "hi",
+  "target": {
+    "kind": "node",
+    "id": 3
+  },
+  "enter": true
+}

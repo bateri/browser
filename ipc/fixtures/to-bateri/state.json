@@ -1,0 +1,20 @@
+{
+  "e": "state",
+  "browser": 1,
+  "url": "http://localhost:3000/",
+  "title": "Dev",
+  "loading": false,
+  "can_back": true,
+  "can_forward": false,
+  "status": "",
+  "zoom": 1.0,
+  "error": {
+    "url": "http://x.test/",
+    "code": -105,
+    "message": "net::ERR_NAME_NOT_RESOLVED"
+  },
+  "found": {
+    "count": 4,
+    "current": 2
+  }
+}

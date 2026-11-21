@@ -1,0 +1,6 @@
+{
+  "e": "refused",
+  "browser": 1,
+  "url": "file:///etc/hosts",
+  "reason": "scheme"
+}

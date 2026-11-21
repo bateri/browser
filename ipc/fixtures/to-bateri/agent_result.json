@@ -1,0 +1,10 @@
+{
+  "e": "agent_result",
+  "browser": 1,
+  "req": 9,
+  "output": {
+    "kind": "text",
+    "text": "hello",
+    "truncated": false
+  }
+}
