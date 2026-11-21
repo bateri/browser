@@ -1163,6 +1163,76 @@ unsafe fn libc_kill(pid: i32, signal: i32) {
     unsafe { kill(pid, signal) };
 }
 
+/// A single-page site (YouTube) going to its next page: a click gives the page a new address
+/// (`history.pushState`) and new content. The title says when the event happened and when the page
+/// handled it (`event.timeStamp`, `performance.now()`).
+const NEXT_PAGE_ON_A_CLICK: &str = "<title>start</title><body style='margin:0'>\
+    <button id=b style='position:fixed;left:0;top:0;width:400px;height:300px'>next</button><script>\
+    document.addEventListener('keydown', e => {\
+      document.title = 'key ' + e.timeStamp + ' ' + performance.now();\
+    });\
+    b.addEventListener('click', e => {\
+      history.pushState({}, '', '/next');\
+      const main = document.createElement('main');\
+      main.innerHTML = '<h1>The next page</h1><p>' + 'Some of its text. '.repeat(100) + '</p>';\
+      document.body.replaceChildren(main);\
+      document.title = 'click ' + e.timeStamp + ' ' + performance.now();\
+    });\
+    </script>";
+
+/// How long before the page handled it an event happened, in milliseconds, from a title of
+/// `NEXT_PAGE_ON_A_CLICK`'s; `None` for an event the page sees as happening before it began.
+fn event_lag(title: &str) -> Option<f64> {
+    let mut parts = title.split(' ').skip(1).map(|n| n.parse::<f64>().unwrap());
+    let (stamp, now) = (parts.next().unwrap(), parts.next().unwrap());
+    (stamp > 0.0).then_some(now - stamp)
+}
+
+/// Chromium dates a "soft navigation" (a click that changes the address and the content) from the
+/// click's own time, and checks that this is after the page began. The engine dates the input the
+/// helper hands it by the application's current event; once the helper had run the system's event
+/// queue for a window of its own (the developer tools'), that event was an old one, the click came
+/// before the page, and the check took the page's process down (`TS_PROCESS_CRASHED 5` on
+/// YouTube). Shows a window on screen for a moment.
+#[test]
+#[ignore]
+fn input_is_dated_when_it_is_sent_and_a_single_page_sites_click_keeps_the_page_alive() {
+    let mut fake = Fake::start();
+    serve(&fake, NEXT_PAGE_ON_A_CLICK);
+    fake.open(1, profile("a", None), 400, 300, 1.0);
+    fake.go(1, "http://before.test/");
+    let on_screen = |fake: &Fake| fake.windows().iter().filter(|w| w.on_screen).count();
+    fake.send(Command::DevTools { browser: 1 });
+    wait_until("the developer tools on screen", || on_screen(&fake) == 1);
+    fake.send(Command::DevTools { browser: 1 });
+    wait_until("the developer tools off screen", || on_screen(&fake) == 0);
+    // The last event the window's queue left behind is older than the page that comes next.
+    std::thread::sleep(Duration::from_millis(500));
+    fake.go(1, "http://page.test/");
+    type_char(&fake, 1, 'a');
+    let key = fake.state_where(1, |s| s.title.starts_with("key "));
+    fake.click(1, 100, 100);
+    let click = fake.state_where(1, |s| s.title.starts_with("click "));
+    assert_eq!(click.url, "http://page.test/next");
+    // The check runs once the new content is painted.
+    let crashed = fake.try_wait(SHORT, |e| {
+        matches!(e, Event::Crashed { .. }).then(|| format!("{e:?}"))
+    });
+    assert_eq!(crashed, None);
+    let AgentOutput::Text { text, .. } = fake.agent(1, AgentOp::Text) else {
+        panic!("not text")
+    };
+    assert!(text.contains("The next page"), "{text:?}");
+    for state in [key, click] {
+        let lag = event_lag(&state.title);
+        assert!(
+            lag.is_some_and(|ms| (0.0..1000.0).contains(&ms)),
+            "{}",
+            state.title
+        );
+    }
+}
+
 #[test]
 #[ignore]
 fn closing_a_browser_answers_what_it_had_open() {

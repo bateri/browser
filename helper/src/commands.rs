@@ -618,12 +618,12 @@ fn apply(id: u32, browser: &Browser, command: Command) {
                 Button::Right => MouseButtonType::RIGHT,
             };
             let clicks = clicks.clamp(1, 3) as i32;
-            match kind {
+            crate::mac::input_now(|| match kind {
                 MouseKind::Move => host.send_mouse_move_event(Some(&event), 0),
                 MouseKind::Leave => host.send_mouse_move_event(Some(&event), 1),
                 MouseKind::Down => host.send_mouse_click_event(Some(&event), button, 0, clicks),
                 MouseKind::Up => host.send_mouse_click_event(Some(&event), button, 1, clicks),
-            }
+            });
         }
         Command::Wheel {
             x, y, dx, dy, mods, ..
@@ -633,7 +633,7 @@ fn apply(id: u32, browser: &Browser, command: Command) {
                 y,
                 modifiers: mods_to_cef(mods),
             };
-            host.send_mouse_wheel_event(Some(&event), dx, dy);
+            crate::mac::input_now(|| host.send_mouse_wheel_event(Some(&event), dx, dy));
         }
         // A key with editing commands goes through the protocol, which can carry them to the page
         // (the engine's own key call cannot); the page's default for the key is then the commands,
@@ -659,7 +659,7 @@ fn apply(id: u32, browser: &Browser, command: Command) {
                     Fired { kind, key },
                 );
             if !sent {
-                host.send_key_event(Some(&key_event_of(kind, &key)));
+                crate::mac::input_now(|| host.send_key_event(Some(&key_event_of(kind, &key))));
             }
         }
         // The Edit menu: the frame that has the focus runs the command on what it has selected, and

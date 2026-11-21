@@ -8,8 +8,10 @@ use objc2::{
     rc::Retained,
     runtime::{AnyObject, Bool},
 };
-use objc2_app_kit::{NSApp, NSApplication, NSEvent, NSEventMask, NSWindow};
-use objc2_foundation::{NSDate, NSDefaultRunLoopMode};
+use objc2_app_kit::{
+    NSApp, NSApplication, NSEvent, NSEventMask, NSEventModifierFlags, NSEventType, NSWindow,
+};
+use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint};
 use std::cell::{Cell, RefCell};
 
 #[derive(Default)]
@@ -33,6 +35,21 @@ define_class!(
             if !was {
                 self.set_handling_send_event(false);
             }
+        }
+
+        /// The engine stamps each mouse and key event it is handed with the time of the
+        /// application's current event (with none, the mouse ones get the engine's own clock and
+        /// the keys no time at all). Off screen no system event stands behind bateri's input, and
+        /// once the event queue has been run for a window of the helper's own (`pump_events`) the
+        /// current event is whichever came last, minutes or hours old. A page that changes its
+        /// address on a click (YouTube) then dated the click before the page itself, and
+        /// Chromium's check on that took the page's process down. So while the helper hands input
+        /// over, the current event is one of that moment.
+        #[unsafe(method_id(currentEvent))]
+        unsafe fn current_event(&self) -> Option<Retained<NSEvent>> {
+            INPUT
+                .with_borrow(|input| input.clone())
+                .or_else(|| unsafe { msg_send![super(self), currentEvent] })
         }
 
         /// The helper has no menus: a quit request (from the system, say) is the main loop's to
@@ -79,6 +96,45 @@ pub fn setup_application() {
         NSApp(MainThreadMarker::new().expect("main thread"))
             .isKindOfClass(HelperApplication::class())
     );
+}
+
+thread_local! {
+    /// What `currentEvent` answers while the helper hands bateri's input to the engine
+    /// (`input_now`). Not an instance variable: the application object is made by AppKit, so one
+    /// that needs dropping is never initialized.
+    static INPUT: RefCell<Option<Retained<NSEvent>>> = const { RefCell::new(None) };
+}
+
+/// The clock event times are read on: seconds since the Mac started, sleep not counted (what
+/// `mach_absolute_time` counts, and what Chromium's own clock reads).
+fn uptime() -> f64 {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a timespec to write into.
+    unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut now) };
+    now.tv_sec as f64 + now.tv_nsec as f64 / 1e9
+}
+
+/// Runs `send` (the helper handing one of bateri's mouse, wheel or key events to the engine) with
+/// `[NSApp currentEvent]` an event of this moment: the engine dates the input by it.
+pub fn input_now<R>(send: impl FnOnce() -> R) -> R {
+    let now = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+        NSEventType::ApplicationDefined,
+        NSPoint::new(0.0, 0.0),
+        NSEventModifierFlags::empty(),
+        uptime(),
+        0,
+        None,
+        0,
+        0,
+        0,
+    );
+    let before = INPUT.replace(now);
+    let out = send();
+    drop(INPUT.replace(before));
+    out
 }
 
 thread_local! {

@@ -252,7 +252,8 @@ pub fn on_result(id: u32, message_id: i32, success: bool, bytes: &[u8]) {
         {
             crate::trace!("cdp {id}#{message_id} failed: the key goes the engine's way");
             if let Some(host) = browser_of(id).and_then(|b| b.host()) {
-                host.send_key_event(Some(&crate::convert::key_event_of(key.kind, &key.key)));
+                let event = crate::convert::key_event_of(key.kind, &key.key);
+                crate::mac::input_now(|| host.send_key_event(Some(&event)));
             }
         }
         return;
