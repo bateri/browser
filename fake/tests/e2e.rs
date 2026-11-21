@@ -12,6 +12,11 @@ use browser_ipc::message::*;
 use browser_ipc::{KIND_VIEW, import};
 use std::time::{Duration, Instant};
 
+/// The helper's own list of what it puts on the engine's command line and in its preferences.
+#[path = "../../helper/src/switches.rs"]
+#[allow(dead_code)]
+mod switches;
+
 const SHORT: Duration = Duration::from_secs(3);
 const KEY_ESCAPE: i32 = 27;
 
@@ -1899,4 +1904,647 @@ fn the_helper_does_not_register_with_the_notification_center() {
         "the helper registered with the notification center:\n{}",
         found.join("\n")
     );
+}
+
+// ---- the network guarantee: nothing leaves except through the proxy ----
+
+/// Whether `haystack` holds `needle`.
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    // SAFETY: both are valid slices for their lengths.
+    unsafe {
+        !libc::memmem(
+            haystack.as_ptr().cast(),
+            haystack.len(),
+            needle.as_ptr().cast(),
+            needle.len(),
+        )
+        .is_null()
+    }
+}
+
+/// The engine's binary inside the bundle under test.
+fn engine_binary() -> Vec<u8> {
+    let app = app_executable();
+    let bundle = app
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent());
+    let path = bundle.expect("bundle").join(
+        "Contents/Frameworks/Chromium Embedded Framework.framework/Chromium Embedded Framework",
+    );
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+#[test]
+#[ignore]
+fn every_switch_and_preference_the_helper_names_is_one_the_engine_has() {
+    // The engine ignores a switch it does not know without a word: three of the first ones
+    // (`dns-prefetch-disable`, `no-proxy-server-autodetect-fallback`,
+    // `force-webrtc-ip-handling-policy`) were never in force. A switch name is a string the
+    // engine carries between two NULs (a substring would find `disable-sync` in other switches).
+    let engine = engine_binary();
+    let exact = |name: &str| contains_bytes(&engine, format!("\0{name}\0").as_bytes());
+    let missing: Vec<&str> = switches::names()
+        .into_iter()
+        .filter(|n| !exact(n))
+        .collect();
+    assert!(missing.is_empty(), "the engine has no switch {missing:?}");
+    let missing: Vec<&str> = switches::PREFS
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|n| !exact(n))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the engine has no preference {missing:?}"
+    );
+    // A feature's name is looked up as text only (the engine keeps some inside longer strings).
+    let missing: Vec<&str> = switches::DISABLED_FEATURES
+        .iter()
+        .copied()
+        .filter(|f| !contains_bytes(&engine, f.as_bytes()))
+        .collect();
+    assert!(missing.is_empty(), "the engine has no feature {missing:?}");
+    // And the policy the engine takes by name.
+    assert!(
+        exact(switches::WEBRTC_POLICY),
+        "the engine does not know {}",
+        switches::WEBRTC_POLICY
+    );
+}
+
+#[test]
+#[ignore]
+fn webrtc_does_not_send_udp_outside_the_proxy() {
+    // A page asks WebRTC to gather candidates with a STUN server on loopback. Left alone the
+    // engine sends a UDP packet there (past the HTTP proxy, which cannot carry UDP); held to
+    // `disable_non_proxied_udp` it sends nothing at all.
+    let sink = std::net::UdpSocket::bind("127.0.0.1:0").expect("a UDP sink");
+    sink.set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let port = sink.local_addr().unwrap().port();
+    let mut fake = Fake::start();
+    let page = format!(
+        "<title>t</title><body><script>\
+         const pc = new RTCPeerConnection({{iceServers: [{{urls: 'stun:127.0.0.1:{port}'}}]}});\
+         pc.createDataChannel('x');\
+         pc.createOffer().then(o => pc.setLocalDescription(o));\
+         document.title = 'ice:started';\
+         setTimeout(() => document.title = 'ice:' + pc.iceGatheringState, 4000);</script>"
+    );
+    fake.proxy.respond(move |_| Reply::html(&page));
+    fake.open(1, profile("a", None), 300, 200, 1.0);
+    fake.send(Command::Navigate {
+        browser: 1,
+        url: "http://page.test/".into(),
+    });
+    // The control: the page ran, asked WebRTC to gather, and four seconds went by (a gathering
+    // that has not finished by then is still waiting for a STUN server that never answers; no
+    // packet means nothing unless the page got as far as asking).
+    let state = fake.state_where(1, |s| {
+        s.title.starts_with("ice:") && s.title != "ice:started"
+    });
+    assert!(
+        state.title == "ice:complete" || state.title == "ice:gathering",
+        "{state:?}"
+    );
+    let mut buf = [0u8; 1500];
+    let mut packets = 0;
+    while sink.recv_from(&mut buf).is_ok() {
+        packets += 1;
+    }
+    assert_eq!(
+        packets, 0,
+        "WebRTC sent UDP to a STUN server outside the proxy"
+    );
+}
+
+#[test]
+#[ignore]
+fn the_network_process_is_told_to_resolve_no_name_but_the_proxys() {
+    // Page host names go to the proxy as names; nothing in the process resolves one itself. The
+    // rule has to reach the engine's network process, where lookups happen.
+    let mut fake = Fake::start();
+    serve(&fake, "<title>t</title><body>a page</body>");
+    fake.open(1, profile("a", None), 200, 100, 1.0);
+    fake.go(1, "http://page.test/");
+    let want = format!("--host-resolver-rules={}", switches::HOST_RESOLVER_RULES);
+    let children = fake.children();
+    let network: Vec<&(u32, String)> = children
+        .iter()
+        .filter(|(_, c)| c.contains("network.mojom.NetworkService"))
+        .collect();
+    assert!(!network.is_empty(), "no network process in {children:?}");
+    for (pid, command) in network {
+        assert!(
+            command.contains(&want),
+            "process {pid} has no resolver rule: {command}"
+        );
+    }
+}
+
+// ---- the developer tools window ----
+
+#[test]
+#[ignore]
+fn a_closed_developer_tools_window_is_not_brought_back_by_the_next_one() {
+    // The closed window stays in the application's list; asking for the developer tools of
+    // another browser must bring forward only the window that request made.
+    let mut fake = Fake::start();
+    serve(&fake, "<title>t</title><body>a page</body>");
+    fake.open(1, profile("a", None), 400, 300, 1.0);
+    fake.open(2, profile("a", None), 400, 300, 1.0);
+    fake.go(1, "http://page.test/");
+    fake.go(2, "http://page.test/");
+    let on_screen = |fake: &Fake| fake.windows().iter().filter(|w| w.on_screen).count();
+    fake.send(Command::DevTools { browser: 1 });
+    wait_until("the first window on screen", || on_screen(&fake) == 1);
+    fake.send(Command::DevTools { browser: 1 });
+    wait_until("the first window off screen", || on_screen(&fake) == 0);
+    fake.send(Command::DevTools { browser: 2 });
+    wait_until("the second window on screen", || on_screen(&fake) >= 1);
+    // The first one would be brought back a moment after, by the same turn of the loop.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(on_screen(&fake), 1, "{:?}", fake.windows());
+    fake.send(Command::DevTools { browser: 2 });
+    wait_until("the second window off screen", || on_screen(&fake) == 0);
+    // Asked for again after it was closed, the same browser gets a window that is brought forward.
+    fake.send(Command::DevTools { browser: 2 });
+    wait_until("a new window on screen", || on_screen(&fake) >= 1);
+    std::thread::sleep(Duration::from_millis(1000));
+    assert_eq!(on_screen(&fake), 1, "{:?}", fake.windows());
+    fake.send(Command::DevTools { browser: 2 });
+    wait_until("the last window off screen", || on_screen(&fake) == 0);
+}
+
+#[test]
+#[ignore]
+fn the_developer_tools_page_loads_in_its_window_under_the_helpers_own_client() {
+    // The tools' window has a client of its own (the page's would stand for the page itself),
+    // which holds the tools' navigation to `devtools://` and sends a window they ask for to
+    // bateri. The helper traces what the client is told; that is the one place its being there
+    // shows (the initial load of the tools' page is not a navigation the client is asked about).
+    // SAFETY: the test binary runs one test at a time (`--test-threads=1`), and the variable is
+    // only read by the helper process started right here.
+    unsafe { std::env::set_var("BATERI_BROWSER_TRACE", "1") };
+    let mut fake = Fake::start();
+    unsafe { std::env::remove_var("BATERI_BROWSER_TRACE") };
+    serve(&fake, "<title>t</title><body>a page</body>");
+    fake.open(1, profile("a", None), 400, 300, 1.0);
+    fake.go(1, "http://page.test/");
+    let renderers = |fake: &Fake| {
+        fake.subprocesses()
+            .iter()
+            .filter(|(_, kind)| kind == "renderer")
+            .count()
+    };
+    let before = renderers(&fake);
+    fake.send(Command::DevTools { browser: 1 });
+    // The tools' page runs in a renderer of its own, and the client was told it was made.
+    wait_until("the tools' page to have a renderer of its own", || {
+        renderers(&fake) > before
+    });
+    wait_until("the tools' own client to hear of its window", || {
+        fake.log()
+            .contains("the developer tools of browser 1 were created")
+    });
+    // Nothing was refused on the way, and nobody was asked for a window.
+    let stray = fake.try_wait(Duration::from_secs(2), |e| match e {
+        Event::Refused { .. } | Event::Window { .. } => Some(format!("{e:?}")),
+        _ => None,
+    });
+    assert_eq!(stray, None);
+    fake.send(Command::DevTools { browser: 1 });
+}
+
+// ---- the context menu ----
+
+/// `cef_menu_id_t::MENU_ID_VIEW_SOURCE`: the engine's "view page source" command.
+const MENU_ID_VIEW_SOURCE: i32 = 132;
+
+#[test]
+#[ignore]
+fn only_a_command_the_menu_offered_is_run_and_view_source_is_not_offered() {
+    let mut fake = Fake::start();
+    serve(
+        &fake,
+        "<title>t</title><body style='margin:0'>\
+         <a href='http://other.test/target' style='position:absolute;left:10px;top:10px;font-size:30px'>a link</a>",
+    );
+    fake.open(1, profile("a", None), 400, 300, 1.0);
+    fake.go(1, "http://page.test/");
+    fake.send(Command::Focus {
+        browser: 1,
+        on: true,
+    });
+    right_click(&fake, 1, 300, 250);
+    let (req, items) = fake.wait(SHORT, |e| match e {
+        Event::Menu { req, items, .. } => Some((*req, items.clone())),
+        _ => None,
+    });
+    assert!(!items.is_empty());
+    assert!(
+        items
+            .iter()
+            .all(|m| m.command != MENU_ID_VIEW_SOURCE && !m.label.to_lowercase().contains("source")),
+        "{items:?}"
+    );
+    // An answer that names a command the menu did not hold (view-source opens an address the
+    // helper never loads): nothing happens, and the next menu still comes.
+    fake.forget();
+    fake.send(Command::MenuResult {
+        req,
+        command: Some(MENU_ID_VIEW_SOURCE),
+    });
+    right_click(&fake, 1, 300, 250);
+    let req2 = fake.wait(SHORT, |e| match e {
+        Event::Menu { req, .. } => Some(*req),
+        _ => None,
+    });
+    assert_ne!(req, req2);
+    let stray: Vec<&Event> = fake
+        .history()
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Event::Window { .. } | Event::Refused { .. } | Event::Error { .. }
+            )
+        })
+        .collect();
+    assert!(stray.is_empty(), "{stray:?}");
+    // One it did hold still runs (Back is there once the page has history).
+    fake.send(Command::MenuResult {
+        req: req2,
+        command: None,
+    });
+}
+
+// ---- downloads ----
+
+fn download_reply(body: &[u8]) -> Reply {
+    Reply {
+        status: 200,
+        headers: vec![
+            ("Content-Type".into(), "application/octet-stream".into()),
+            (
+                "Content-Disposition".into(),
+                "attachment; filename=\"f.bin\"".into(),
+            ),
+        ],
+        body: body.to_vec(),
+    }
+}
+
+fn progress_of(e: &Event, want: u32) -> Option<DownloadState> {
+    match e {
+        Event::DownloadProgress { req, state, .. } if *req == want => Some(*state),
+        _ => None,
+    }
+}
+
+#[test]
+#[ignore]
+fn a_download_that_breaks_off_is_over_and_says_so() {
+    let mut fake = Fake::start();
+    fake.proxy
+        .respond(|_| download_reply(&[7u8; 100]).cut_after(10));
+    let dir = scratch("dl-cut");
+    fake.open(1, profile("a", None), 200, 100, 1.0);
+    fake.send(Command::Navigate {
+        browser: 1,
+        url: "http://dl.test/f.bin".into(),
+    });
+    let req = fake.wait(SHORT, |e| match e {
+        Event::Download { req, .. } => Some(*req),
+        _ => None,
+    });
+    let dest = dir.join("cut.bin");
+    fake.send(Command::DownloadResult {
+        req,
+        path: Some(dest.to_string_lossy().into_owned()),
+    });
+    // An interrupted download does not come back: the last word is `Canceled`, once.
+    fake.wait(Duration::from_secs(10), |e| {
+        (progress_of(e, req) == Some(DownloadState::Canceled)).then_some(())
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let ends = fake
+        .history()
+        .iter()
+        .filter(|e| progress_of(e, req) == Some(DownloadState::Canceled))
+        .count();
+    assert_eq!(ends, 1, "{}", fake.recent(8));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[ignore]
+fn closing_the_page_cancels_the_download_it_started() {
+    let mut fake = Fake::start();
+    fake.proxy
+        .respond(|_| download_reply(&[7u8; 100]).stalled_after(10));
+    let dir = scratch("dl-close");
+    fake.open(1, profile("a", None), 200, 100, 1.0);
+    fake.send(Command::Navigate {
+        browser: 1,
+        url: "http://dl.test/f.bin".into(),
+    });
+    let req = fake.wait(SHORT, |e| match e {
+        Event::Download { req, .. } => Some(*req),
+        _ => None,
+    });
+    fake.send(Command::DownloadResult {
+        req,
+        path: Some(dir.join("slow.bin").to_string_lossy().into_owned()),
+    });
+    fake.wait(SHORT, |e| {
+        (progress_of(e, req) == Some(DownloadState::Running)).then_some(())
+    });
+    fake.send(Command::Close { browser: 1 });
+    fake.wait(Duration::from_secs(10), |e| {
+        (progress_of(e, req) == Some(DownloadState::Canceled)).then_some(())
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let ends = fake
+        .history()
+        .iter()
+        .filter(|e| progress_of(e, req) == Some(DownloadState::Canceled))
+        .count();
+    assert_eq!(ends, 1, "{}", fake.recent(8));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[ignore]
+fn a_refused_download_is_canceled_once() {
+    let mut fake = Fake::start();
+    fake.proxy.respond(|_| download_reply(b"0123456789"));
+    fake.open(1, profile("a", None), 200, 100, 1.0);
+    fake.send(Command::Navigate {
+        browser: 1,
+        url: "http://dl.test/f.bin".into(),
+    });
+    let req = fake.wait(SHORT, |e| match e {
+        Event::Download { req, .. } => Some(*req),
+        _ => None,
+    });
+    fake.send(Command::DownloadResult { req, path: None });
+    fake.wait(SHORT, |e| {
+        (progress_of(e, req) == Some(DownloadState::Canceled)).then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    let ends = fake
+        .history()
+        .iter()
+        .filter(|e| progress_of(e, req).is_some_and(|s| s != DownloadState::Running))
+        .count();
+    assert_eq!(ends, 1, "the same request ended twice: {}", fake.recent(8));
+}
+
+#[test]
+#[ignore]
+fn a_pages_own_blob_is_an_ordinary_download() {
+    // The way a web app saves what it made: not an address of anyone else's, so not refused.
+    // (In an inline handler `URL` is `document.URL`, a string: the page says `window.URL`.)
+    let mut fake = Fake::start();
+    serve(
+        &fake,
+        "<title>t</title><body style='margin:0'>\
+         <button style='position:absolute;left:0;top:0;width:100px;height:30px' \
+         onclick=\"const a=document.createElement('a');a.href=window.URL.createObjectURL(new Blob(['hello blob']));a.download='b.txt';a.click()\">d</button>",
+    );
+    let dir = scratch("dl-blob");
+    fake.open(1, profile("a", None), 200, 100, 1.0);
+    fake.go(1, "http://dl.test/blob");
+    fake.send(Command::Focus {
+        browser: 1,
+        on: true,
+    });
+    fake.click(1, 50, 15);
+    let (req, name) = fake.wait(SHORT, |e| match e {
+        Event::Download { req, name, .. } => Some((*req, name.clone())),
+        _ => None,
+    });
+    assert_eq!(name, "b.txt");
+    let dest = dir.join("b.txt");
+    fake.send(Command::DownloadResult {
+        req,
+        path: Some(dest.to_string_lossy().into_owned()),
+    });
+    fake.wait(SHORT, |e| {
+        (progress_of(e, req) == Some(DownloadState::Done)).then_some(())
+    });
+    assert_eq!(std::fs::read(&dest).unwrap(), b"hello blob");
+    assert!(
+        !fake
+            .history()
+            .iter()
+            .any(|e| matches!(e, Event::Refused { .. }))
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+// ---- questions that go void, and work that goes unanswered ----
+
+#[test]
+#[ignore]
+fn a_page_that_moves_on_voids_the_question_it_had_open() {
+    let mut fake = Fake::start();
+    serve(
+        &fake,
+        "<title>t</title><body style='margin:0'><button style='position:absolute;left:0;top:0;width:100px;height:30px' \
+         onclick=\"document.title='c:'+confirm('sure?')\">c</button>",
+    );
+    fake.open(1, profile("a", None), 300, 200, 1.0);
+    fake.go(1, "http://page.test/");
+    fake.send(Command::Focus {
+        browser: 1,
+        on: true,
+    });
+    fake.click(1, 50, 15);
+    let req = fake.wait(SHORT, |e| match e {
+        Event::Dialog { req, .. } => Some(*req),
+        _ => None,
+    });
+    fake.send(Command::Navigate {
+        browser: 1,
+        url: "about:blank".into(),
+    });
+    // bateri is told the question is void, once.
+    let void = fake.wait(SHORT, |e| match e {
+        Event::DialogVoid { browser: 1, req } => Some(*req),
+        _ => None,
+    });
+    assert_eq!(void, req);
+    // And an answer that arrives late is ignored without a word.
+    fake.send(Command::DialogResult {
+        req,
+        ok: true,
+        text: String::new(),
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        fake.history()
+            .iter()
+            .filter(|e| matches!(e, Event::DialogVoid { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        !fake
+            .history()
+            .iter()
+            .any(|e| matches!(e, Event::Error { .. })),
+        "{}",
+        fake.recent(6)
+    );
+}
+
+#[test]
+#[ignore]
+fn closing_with_a_leave_page_question_open_closes() {
+    let mut fake = Fake::start();
+    serve(
+        &fake,
+        "<title>t</title><body style='margin:0'><button style='position:absolute;left:0;top:0;width:100px;height:30px'>b</button>\
+         <script>window.onbeforeunload = e => { e.preventDefault(); return 'x'; }</script>",
+    );
+    fake.open(1, profile("a", None), 300, 200, 1.0);
+    fake.go(1, "http://page.test/");
+    fake.send(Command::Focus {
+        browser: 1,
+        on: true,
+    });
+    // The question only comes for a page the person has used.
+    fake.click(1, 50, 15);
+    fake.send(Command::Navigate {
+        browser: 1,
+        url: "about:blank".into(),
+    });
+    let (req, kind) = fake.wait(SHORT, |e| match e {
+        Event::Dialog { req, kind, .. } => Some((*req, *kind)),
+        _ => None,
+    });
+    assert_eq!(kind, DialogKind::BeforeUnload);
+    let _ = req;
+    fake.send(Command::Close { browser: 1 });
+    fake.wait(SHORT, |e| {
+        matches!(e, Event::Closed { browser: 1 }).then_some(())
+    });
+}
+
+#[test]
+#[ignore]
+fn an_agent_job_for_a_browser_that_never_came_up_is_answered() {
+    let mut fake = Fake::start();
+    let p = profile("a", None);
+    fake.proxy.accept(&p.user, &p.pass);
+    // Open, ask, close: all before the engine has made the browser.
+    fake.send(Command::Open {
+        browser: 1,
+        profile: p,
+        width: 200,
+        height: 100,
+        scale: 1.0,
+    });
+    fake.send(Command::Agent {
+        browser: 1,
+        req: 11,
+        op: AgentOp::Text,
+    });
+    fake.send(Command::Close { browser: 1 });
+    let output = fake.wait(DEFAULT_WAIT_LONG, |e| match e {
+        Event::AgentResult {
+            req: 11, output, ..
+        } => Some(output.clone()),
+        _ => None,
+    });
+    assert!(matches!(output, AgentOutput::Failed { .. }), "{output:?}");
+    // And for a browser nobody opened.
+    let output = fake.agent(9, AgentOp::Text);
+    assert!(matches!(output, AgentOutput::Failed { .. }), "{output:?}");
+}
+
+const DEFAULT_WAIT_LONG: Duration = Duration::from_secs(20);
+
+#[test]
+#[ignore]
+fn agent_jobs_sent_before_the_browser_is_up_are_each_answered_once() {
+    let mut fake = Fake::start();
+    let p = profile("a", None);
+    fake.proxy.accept(&p.user, &p.pass);
+    fake.send(Command::Open {
+        browser: 1,
+        profile: p,
+        width: 200,
+        height: 100,
+        scale: 1.0,
+    });
+    for req in 1000..1300 {
+        fake.send(Command::Agent {
+            browser: 1,
+            req,
+            op: AgentOp::Text,
+        });
+    }
+    // Every job gets exactly one answer, whether it ran once the browser was up or was turned
+    // away at the door. How many were turned away depends on how fast the browser comes up against
+    // how fast 300 commands arrive, so the count is not asserted here: that the queue hands a
+    // command back at its limit is a unit test in `helper/src/commands.rs`.
+    let mut answered = std::collections::HashMap::new();
+    while answered.len() < 300 {
+        let (req, output) = fake.wait(DEFAULT_WAIT_LONG, |e| match e {
+            Event::AgentResult { req, output, .. } if (1000..1300).contains(req) => {
+                Some((*req, output.clone()))
+            }
+            _ => None,
+        });
+        assert!(
+            answered.insert(req, output).is_none(),
+            "{req} answered twice"
+        );
+    }
+    let again = fake.try_wait(Duration::from_millis(500), |e| match e {
+        Event::AgentResult { req, .. } if (1000..1300).contains(req) => Some(*req),
+        _ => None,
+    });
+    assert_eq!(again, None, "a job was answered twice");
+}
+
+#[test]
+#[ignore]
+fn quitting_with_a_question_and_a_download_open_leaves_in_order() {
+    let mut fake = Fake::start();
+    fake.proxy.respond(|seen| match seen.path.as_str() {
+        "/f.bin" => download_reply(&[7u8; 100]).stalled_after(10),
+        _ => Reply::html(
+            "<title>t</title><body style='margin:0'><button style='position:absolute;left:0;top:0;width:100px;height:30px' \
+             onclick=\"document.title='c:'+confirm('sure?')\">c</button>",
+        ),
+    });
+    let dir = scratch("quit-open");
+    fake.open(1, profile("a", None), 300, 200, 1.0);
+    fake.open(2, profile("a", None), 300, 200, 1.0);
+    fake.send(Command::Navigate {
+        browser: 2,
+        url: "http://dl.test/f.bin".into(),
+    });
+    let req = fake.wait(SHORT, |e| match e {
+        Event::Download { req, .. } => Some(*req),
+        _ => None,
+    });
+    fake.send(Command::DownloadResult {
+        req,
+        path: Some(dir.join("slow.bin").to_string_lossy().into_owned()),
+    });
+    fake.go(1, "http://page.test/");
+    fake.send(Command::Focus {
+        browser: 1,
+        on: true,
+    });
+    fake.click(1, 50, 15);
+    fake.wait(SHORT, |e| matches!(e, Event::Dialog { .. }).then_some(()));
+    assert_eq!(fake.quit(), Some(0));
+    let _ = std::fs::remove_dir_all(dir);
 }

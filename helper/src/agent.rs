@@ -2,11 +2,12 @@
 //! the engine's DevTools protocol. A job is a short chain of protocol calls; each answer comes
 //! back to `on_result`, which runs the next call or finishes the job.
 
-use crate::state::{browser_of, emit, with_entry};
+use crate::state::{Fired, browser_of, emit, with_entry};
+use browser_ipc::Command;
 use browser_ipc::message::{AgentOp, AgentOutput, Event, Target};
 use cef::*;
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 /// The longest text a job returns.
 pub const MAX_TEXT: usize = 1 << 20;
@@ -26,6 +27,12 @@ enum Kind {
     Quads,
     /// Calls whose answers only matter by succeeding.
     Plain,
+}
+
+/// The strings of a JSON array, one after the other: an item that is no string is left out, and
+/// leaves no hole in the list the engine is given (an index past the end pads it with nulls).
+fn string_items(items: &[Value]) -> Vec<&str> {
+    items.iter().filter_map(Value::as_str).collect()
 }
 
 /// A flat JSON object as the engine's dictionary type.
@@ -54,10 +61,8 @@ fn to_dict(params: &Value) -> DictionaryValue {
                 // Lists of strings (the editing commands of a key).
                 Value::Array(items) => {
                     let mut list = list_value_create().expect("list");
-                    for (at, item) in items.iter().enumerate() {
-                        if let Value::String(s) = item {
-                            list.set_string(at, Some(&s.as_str().into()));
-                        }
+                    for (at, item) in string_items(items).into_iter().enumerate() {
+                        list.set_string(at, Some(&item.into()));
                     }
                     dict.set_list(Some(&key), Some(&mut list));
                 }
@@ -198,19 +203,39 @@ fn step(id: u32, mut job: Job) {
 /// A protocol call whose answer nobody waits for (the page's own reaction is what matters), so no
 /// job. Its number comes from the same count as the jobs', and `on_result` lets an answer it does
 /// not know go. `false` when the call could not be sent.
-pub fn fire(id: u32, method: &'static str, params: Value) -> bool {
+///
+/// The answer is not waited for, but it is not lost: if the call fails (the protocol refused it,
+/// or the page was in no state to take it) `key` is sent the engine's own way, so no key
+/// disappears (`on_result`).
+pub fn fire(id: u32, method: &'static str, params: Value, key: Fired) -> bool {
     let Some(host) = browser_of(id).and_then(|b| b.host()) else {
         return false;
     };
     let Some(message_id) = with_entry(id, |e| {
         e.next_cdp += 1;
+        e.fired.insert(e.next_cdp, key);
         e.next_cdp
     }) else {
         return false;
     };
     crate::trace!("cdp {id}#{message_id} {method} {params}");
     let mut dict = to_dict(&params);
-    host.execute_dev_tools_method(message_id, Some(&method.into()), Some(&mut dict)) != 0
+    let sent =
+        host.execute_dev_tools_method(message_id, Some(&method.into()), Some(&mut dict)) != 0;
+    if !sent {
+        with_entry(id, |e| e.fired.remove(&message_id));
+    }
+    sent
+}
+
+/// The answer to a fired call, and what is owed for it: the key to send again when it failed.
+pub fn settle_fired(
+    fired: &mut HashMap<i32, Fired>,
+    message_id: i32,
+    success: bool,
+) -> Option<Fired> {
+    let key = fired.remove(&message_id)?;
+    (!success).then_some(key)
 }
 
 fn failed(message: &str) -> AgentOutput {
@@ -222,6 +247,14 @@ fn failed(message: &str) -> AgentOutput {
 /// The answer to a protocol call.
 pub fn on_result(id: u32, message_id: i32, success: bool, bytes: &[u8]) {
     let Some(Some(mut job)) = with_entry(id, |e| e.jobs.remove(&message_id)) else {
+        // Not a job's: a fired key, whose failure sends it again.
+        if let Some(Some(key)) = with_entry(id, |e| settle_fired(&mut e.fired, message_id, success))
+        {
+            crate::trace!("cdp {id}#{message_id} failed: the key goes the engine's way");
+            if let Some(host) = browser_of(id).and_then(|b| b.host()) {
+                host.send_key_event(Some(&crate::convert::key_event_of(key.kind, &key.key)));
+            }
+        }
         return;
     };
     let json: Value = serde_json::from_slice(bytes).unwrap_or(Value::Null);
@@ -275,11 +308,31 @@ pub fn on_result(id: u32, message_id: i32, success: bool, bytes: &[u8]) {
 
 /// A job whose browser went away answers that it did.
 pub fn fail_all(id: u32, why: &str) {
-    let Some(jobs) = with_entry(id, |e| std::mem::take(&mut e.jobs)) else {
+    let Some((jobs, _fired)) = with_entry(id, |e| {
+        (std::mem::take(&mut e.jobs), std::mem::take(&mut e.fired))
+    }) else {
         return;
     };
     for (_, job) in jobs {
         finish(id, job.req, failed(why));
+    }
+}
+
+/// A job for a browser that never came up, or that is not there: answered at once instead of
+/// being dropped with the commands that were waiting for it. `false` for a command that is no
+/// job (it is not answered).
+pub fn refuse(id: u32, command: &Command, why: &str) -> bool {
+    let Command::Agent { req, .. } = command else {
+        return false;
+    };
+    finish(id, *req, failed(why));
+    true
+}
+
+/// The commands kept for a browser that never came up: the jobs among them are answered.
+pub fn refuse_all(id: u32, queue: &[Command], why: &str) {
+    for command in queue {
+        refuse(id, command, why);
     }
 }
 
@@ -394,6 +447,49 @@ mod tests {
         assert_eq!(cap_text("abcdef", 3), ("abc".to_string(), true));
         // 'ç' is two bytes: a cut inside it backs up.
         assert_eq!(cap_text("açb", 2), ("a".to_string(), true));
+    }
+
+    #[test]
+    fn a_list_the_engine_is_given_has_no_holes() {
+        let items = [
+            json!("moveLeft"),
+            json!(1),
+            json!("selectAll"),
+            json!(null),
+            json!("x"),
+        ];
+        assert_eq!(string_items(&items), ["moveLeft", "selectAll", "x"]);
+        assert!(string_items(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_fired_key_whose_call_failed_is_owed_to_the_engine_and_one_that_worked_is_not() {
+        use browser_ipc::message::{KeyData, KeyKind};
+        let key = |vk| Fired {
+            kind: KeyKind::Down,
+            key: KeyData {
+                vk,
+                ..Default::default()
+            },
+        };
+        let mut fired = HashMap::from([(1, key(37)), (2, key(39)), (3, key(40))]);
+        assert_eq!(settle_fired(&mut fired, 1, true), None);
+        assert_eq!(settle_fired(&mut fired, 2, false), Some(key(39)));
+        // Each answer settles once; a number that was never fired (a job's) owes nothing.
+        assert_eq!(settle_fired(&mut fired, 2, false), None);
+        assert_eq!(settle_fired(&mut fired, 9, false), None);
+        assert_eq!(fired.len(), 1);
+    }
+
+    #[test]
+    fn only_jobs_are_answered_when_their_browser_never_came_up() {
+        let job = Command::Agent {
+            browser: 1,
+            req: 5,
+            op: AgentOp::Text,
+        };
+        assert!(refuse(1, &job, "gone"));
+        assert!(!refuse(1, &Command::Back { browser: 1 }, "gone"));
     }
 
     #[test]

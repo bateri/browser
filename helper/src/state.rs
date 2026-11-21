@@ -7,11 +7,12 @@
 //! `with_entry`), let go, then call.
 
 use crate::agent::Job;
-use browser_ipc::message::{Event, Found, LoadError};
+use browser_ipc::message::{DialogKind, Event, Found, KeyData, KeyKind, LoadError};
 use browser_ipc::{Command, Sender};
 use cef::*;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -157,6 +158,9 @@ impl Creds {
 
 pub struct Context {
     pub context: RequestContext,
+    /// Why the context may not be used (a preference that keeps the network closed is not in
+    /// force): no browser is opened in it.
+    pub failed: Option<String>,
     pub creds: Arc<Creds>,
     /// The profile's folder name under the root; `None` is a profile that lives in memory only.
     pub dir: Option<String>,
@@ -204,6 +208,9 @@ pub struct Entry {
     /// A frame was dropped (bateri behind): ask for a fresh one when this time comes.
     pub repaint_at: Option<Instant>,
     pub jobs: HashMap<i32, Job>,
+    /// Keys sent through the protocol whose answer has not come, by call number: if the call
+    /// fails the key is sent again the engine's own way (see `agent::fire`).
+    pub fired: HashMap<i32, Fired>,
     pub next_cdp: i32,
     /// The developer tools were asked for: until this time the helper brings their window to the
     /// front (the engine makes it a moment later, and a background app's windows do not come
@@ -212,15 +219,32 @@ pub struct Entry {
     pub closing: bool,
 }
 
-/// Answers the helper is waiting for from bateri.
+/// A key sent to the page as a protocol call: what to send the engine's own way if the call fails.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fired {
+    pub kind: KeyKind,
+    pub key: KeyData,
+}
+
+/// A running download.
+pub struct Download {
+    /// bateri's number for it.
+    pub req: u32,
+    /// The callback that cancels it, from the engine's latest update.
+    pub cancel: Option<DownloadItemCallback>,
+}
+
+/// Answers the helper is waiting for from bateri: `(browser, ...)`.
 #[derive(Default)]
 pub struct Pending {
-    pub menus: HashMap<u32, (u32, RunContextMenuCallback)>,
-    pub dialogs: HashMap<u32, (u32, JsdialogCallback)>,
+    /// The callback, and the commands the menu held (the only ones an answer may run).
+    pub menus: HashMap<u32, (u32, RunContextMenuCallback, Vec<i32>)>,
+    pub dialogs: HashMap<u32, (u32, DialogKind, JsdialogCallback)>,
     pub files: HashMap<u32, (u32, FileDialogCallback)>,
     pub before_download: HashMap<u32, (u32, BeforeDownloadCallback)>,
-    /// Running downloads: CEF's item id → (request, the callback that cancels it).
-    pub downloads: HashMap<u32, (u32, Option<DownloadItemCallback>)>,
+    /// Running downloads by (browser, the engine's item number): two profiles' download managers
+    /// each count from their own start, so the item number alone is not one download's.
+    pub downloads: HashMap<(u32, u32), Download>,
 }
 
 #[derive(Default)]
@@ -228,8 +252,9 @@ pub struct State {
     pub ready: bool,
     pub entries: HashMap<u32, Entry>,
     pub contexts: HashMap<String, Context>,
-    /// Contexts the engine reported ready before they were put away.
-    pub early: HashSet<String>,
+    /// Contexts the engine reported ready before they were put away, and why one of them may not
+    /// be used (`Context::failed`).
+    pub early: HashMap<String, Option<String>>,
     pub frames: Option<Sender>,
     pub seq: u32,
     pub next_req: u32,
@@ -253,10 +278,82 @@ pub fn browser_of(id: u32) -> Option<Browser> {
     STATE.with_borrow(|s| s.entries.get(&id).and_then(|e| e.browser.clone()))
 }
 
+/// Takes out of `map` every entry `pick` chooses and hands them over. Letting go of an engine
+/// handle may call back into a handler, which borrows the state: whoever receives these drops
+/// them after the borrow is over, never inside `with`.
+pub fn take_where<K: Eq + Hash + Clone, V>(
+    map: &mut HashMap<K, V>,
+    mut pick: impl FnMut(&K, &V) -> bool,
+) -> Vec<(K, V)> {
+    let keys: Vec<K> = map
+        .iter()
+        .filter(|(k, v)| pick(k, v))
+        .map(|(k, _)| k.clone())
+        .collect();
+    keys.into_iter()
+        .filter_map(|k| map.remove_entry(&k))
+        .collect()
+}
+
 /// A number for the next question bateri is asked (menu, dialog, file dialog, download).
 pub fn next_req() -> u32 {
     with(|s| {
         s.next_req += 1;
         s.next_req
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::rc::Rc;
+
+    /// Something whose drop calls back into the state, as an engine handle's can.
+    struct Handle(Rc<std::cell::Cell<u32>>);
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            // Panics when the state is borrowed: that is the mistake this guards against.
+            with(|_| ());
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn what_is_taken_out_is_handed_over_not_dropped_inside_the_borrow() {
+        let dropped = Rc::new(std::cell::Cell::new(0));
+        let mut map: HashMap<u32, (u32, Handle)> = HashMap::new();
+        for (req, browser) in [(1, 7), (2, 7), (3, 8)] {
+            map.insert(req, (browser, Handle(dropped.clone())));
+        }
+        let taken = with(|_| take_where(&mut map, |_, v| v.0 == 7));
+        assert_eq!(dropped.get(), 0, "dropped while the state was borrowed");
+        assert_eq!(taken.len(), 2);
+        assert_eq!(map.len(), 1);
+        drop(taken);
+        assert_eq!(dropped.get(), 2);
+    }
+
+    #[test]
+    fn downloads_of_two_profiles_with_one_item_number_are_two_downloads() {
+        let mut pending = Pending::default();
+        pending.downloads.insert(
+            (1, 1),
+            Download {
+                req: 10,
+                cancel: None,
+            },
+        );
+        pending.downloads.insert(
+            (2, 1),
+            Download {
+                req: 11,
+                cancel: None,
+            },
+        );
+        let gone = take_where(&mut pending.downloads, |k, _| k.0 == 2);
+        assert_eq!(gone.len(), 1);
+        assert_eq!(gone[0].1.req, 11);
+        assert_eq!(pending.downloads[&(1, 1)].req, 10);
+    }
 }

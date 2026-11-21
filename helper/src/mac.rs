@@ -10,7 +10,7 @@ use objc2::{
 };
 use objc2_app_kit::{NSApp, NSApplication, NSEvent, NSEventMask, NSWindow};
 use objc2_foundation::{NSDate, NSDefaultRunLoopMode};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 #[derive(Default)]
 pub struct Ivars {
@@ -81,23 +81,68 @@ pub fn setup_application() {
     );
 }
 
-/// Puts the helper's windows in front, and the helper in front of the other apps: it is a
-/// background app (`LSUIElement`), so the developer tools' window would otherwise open behind
-/// whatever the person is looking at. Returns whether a window is up now.
-pub fn show_windows() -> bool {
+thread_local! {
+    /// Windows that are not the ones a developer-tools request is waiting for: the ones there were
+    /// when it was made, and the ones already brought forward. They are held (retained), so a
+    /// window's address is never taken for another's after it is gone.
+    static CLAIMED: RefCell<Vec<Retained<NSWindow>>> = const { RefCell::new(Vec::new()) };
+}
+
+fn same(a: &Retained<NSWindow>, b: &Retained<NSWindow>) -> bool {
+    std::ptr::eq(Retained::as_ptr(a), Retained::as_ptr(b))
+}
+
+/// Called before the developer tools are asked for: every window there is now is not theirs. A
+/// closed window stays in the application's list for good (measured), and bringing it forward
+/// would show the tools of a page that was put away.
+pub fn note_existing_windows() {
     let Some(mtm) = MainThreadMarker::new() else {
-        return false;
+        return;
+    };
+    let windows: Vec<Retained<NSWindow>> = NSApp(mtm).windows().iter().collect();
+    CLAIMED.with_borrow_mut(|claimed| {
+        for window in windows {
+            if !claimed.iter().any(|c| same(c, &window)) {
+                claimed.push(window);
+            }
+        }
+    });
+}
+
+/// Puts windows nobody has claimed (the ones a request for the developer tools made since
+/// `note_existing_windows`) in front, and the helper in front of the other apps: it is a
+/// background app (`LSUIElement`), so the tools' window would otherwise open behind whatever the
+/// person is looking at. Returns how many are on screen now.
+pub fn front_new_windows() -> usize {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return 0;
     };
     let app = NSApp(mtm);
     let windows: Vec<Retained<NSWindow>> = app.windows().iter().collect();
-    let mut shown = false;
-    for window in &windows {
-        if !window.isVisible() {
-            window.makeKeyAndOrderFront(None);
+    let mut shown = 0;
+    let mut released = Vec::new();
+    CLAIMED.with_borrow_mut(|claimed| {
+        // What is gone from the list is let go of (after the borrow: AppKit may call back).
+        let (kept, gone) = std::mem::take(claimed)
+            .into_iter()
+            .partition(|c| windows.iter().any(|w| same(w, c)));
+        *claimed = kept;
+        released = gone;
+        for window in &windows {
+            if claimed.iter().any(|c| same(c, window)) {
+                continue;
+            }
+            if !window.isVisible() {
+                window.makeKeyAndOrderFront(None);
+            }
+            if window.isVisible() {
+                claimed.push(window.clone());
+                shown += 1;
+            }
         }
-        shown |= window.isVisible();
-    }
-    if shown {
+    });
+    drop(released);
+    if shown > 0 {
         #[allow(deprecated)]
         app.activateIgnoringOtherApps(true);
     }

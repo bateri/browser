@@ -51,7 +51,23 @@ impl Reply {
         self.headers.push((name.into(), value.into()));
         self
     }
+
+    /// The answer promises all of its body but sends only its first `n` bytes and then stays
+    /// silent (a download that is still running) until the stub proxy is dropped.
+    pub fn stalled_after(self, n: usize) -> Self {
+        self.header(PARTIAL, &format!("{n} stall"))
+    }
+
+    /// The answer promises all of its body, sends its first `n` bytes and cuts the connection
+    /// (a download that breaks off).
+    pub fn cut_after(self, n: usize) -> Self {
+        self.header(PARTIAL, &format!("{n} cut"))
+    }
 }
+
+/// A pseudo-header the stub reads and does not send: how much of the body goes out, and what
+/// then (`stall` or `cut`).
+const PARTIAL: &str = "x-stub-partial";
 
 type Responder = dyn Fn(&Seen) -> Reply + Send + Sync;
 
@@ -228,10 +244,31 @@ fn serve(stream: TcpStream, shared: Arc<Shared>) {
             reply.status,
             reply.body.len()
         );
+        let mut partial = None;
         for (k, v) in &reply.headers {
+            if k.eq_ignore_ascii_case(PARTIAL) {
+                partial = v
+                    .split_once(' ')
+                    .and_then(|(n, then)| Some((n.parse::<usize>().ok()?, then.to_string())));
+                continue;
+            }
             head.push_str(&format!("{k}: {v}\r\n"));
         }
         head.push_str("\r\n");
+        if let Some((first, then)) = partial {
+            let first = first.min(reply.body.len());
+            if out.write_all(head.as_bytes()).is_err()
+                || out.write_all(&reply.body[..first]).is_err()
+            {
+                return;
+            }
+            if then == "stall" {
+                while !shared.stop.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            return;
+        }
         if out.write_all(head.as_bytes()).is_err() || out.write_all(&reply.body).is_err() {
             return;
         }

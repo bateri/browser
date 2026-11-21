@@ -474,6 +474,13 @@ pub enum Event {
         message: String,
         default_text: String,
     },
+    /// The page moved on (it navigated) while a `Dialog` was open: that question is void and
+    /// nobody is waiting for its answer any more; a `DialogResult` for it is ignored. bateri
+    /// takes the question down.
+    DialogVoid {
+        browser: u32,
+        req: u32,
+    },
     FileDialog {
         browser: u32,
         req: u32,
@@ -593,6 +600,7 @@ impl Event {
             Event::UnhandledKey { .. } => "unhandled_key",
             Event::Menu { .. } => "menu",
             Event::Dialog { .. } => "dialog",
+            Event::DialogVoid { .. } => "dialog_void",
             Event::FileDialog { .. } => "file_dialog",
             Event::Download { .. } => "download",
             Event::DownloadProgress { .. } => "download_progress",
@@ -617,6 +625,7 @@ impl Event {
             | Event::UnhandledKey { browser, .. }
             | Event::Menu { browser, .. }
             | Event::Dialog { browser, .. }
+            | Event::DialogVoid { browser, .. }
             | Event::FileDialog { browser, .. }
             | Event::Download { browser, .. }
             | Event::AgentResult { browser, .. } => Some(*browser),

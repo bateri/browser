@@ -13,6 +13,7 @@ mod keys;
 mod mac;
 mod rules;
 mod state;
+mod switches;
 
 pub use state::request_quit;
 
@@ -51,41 +52,25 @@ wrap_app! {
             // The one proxy every request goes through, loopback included (a page on localhost is
             // bateri's to see too). Chromium's own command line is off, so nothing else can set it.
             let proxy = format!("http://127.0.0.1:{}", self.proxy_port);
-            cl.append_switch_with_value(Some(&"proxy-server".into()), Some(&proxy.as_str().into()));
-            cl.append_switch_with_value(Some(&"proxy-bypass-list".into()), Some(&"<-loopback>".into()));
-            // Without this CEF hands a proxy's 407 to Chrome's own login prompt, which an off-screen
-            // browser does not have, and `auth_credentials` is never called.
-            cl.append_switch(Some(&"disable-chrome-login-prompt".into()));
-            cl.append_switch(Some(&"noerrdialogs".into()));
+            cl.append_switch_with_value(
+                Some(&switches::PROXY_SERVER.into()),
+                Some(&proxy.as_str().into()),
+            );
             if self.mock_keychain {
-                cl.append_switch(Some(&"use-mock-keychain".into()));
+                cl.append_switch(Some(&switches::MOCK_KEYCHAIN.into()));
             }
             // Nothing leaves this process except through the proxy: no background services, no
-            // QUIC (UDP), no DNS prefetch or preconnect, no WebRTC UDP outside the proxy.
-            for switch in [
-                "disable-background-networking",
-                "disable-component-update",
-                "disable-quic",
-                "dns-prefetch-disable",
-                "disable-sync",
-                "disable-default-apps",
-                "no-pings",
-                "disable-domain-reliability",
-                "no-proxy-server-autodetect-fallback",
-            ] {
-                cl.append_switch(Some(&switch.into()));
+            // QUIC (UDP), no host name resolved here, no WebRTC UDP outside the proxy
+            // (`switches` names each one and the end-to-end suite looks them up in the engine).
+            for switch in switches::PLAIN {
+                cl.append_switch(Some(&(*switch).into()));
+            }
+            for (switch, value) in switches::VALUED {
+                cl.append_switch_with_value(Some(&(*switch).into()), Some(&(*value).into()));
             }
             cl.append_switch_with_value(
-                Some(&"force-webrtc-ip-handling-policy".into()),
-                Some(&"disable_non_proxied_udp".into()),
-            );
-            // Also off: the macOS notification bridge. It starts a helper of its own that registers
-            // the app with the system's notification center, which makes the system ask the person
-            // whether "bateri Browser" may send notifications; the helper never shows any (a
-            // page's request is refused), so it must not appear there at all.
-            cl.append_switch_with_value(
                 Some(&"disable-features".into()),
-                Some(&"OptimizationHints,OptimizationGuideModelDownloading,Translate,MediaRouter,CertificateTransparencyComponentUpdater,AutofillServerCommunication,SafeBrowsing,NativeNotifications".into()),
+                Some(&switches::disabled_features().as_str().into()),
             );
         }
 

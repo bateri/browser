@@ -53,6 +53,73 @@ pub fn scheme_allowed(url: &str, main_frame: bool) -> bool {
     !main_frame && (lower == "about:srcdoc" || lower.starts_with("blob:"))
 }
 
+/// What bateri is told when a page asks for a new window (or the developer tools' page does): the
+/// address when the helper loads it, `Refused` when it does not.
+pub fn window_event(browser: u32, url: &str, background: bool) -> browser_ipc::message::Event {
+    use browser_ipc::message::Event;
+    if scheme_allowed(url, true) {
+        Event::Window {
+            browser,
+            url: url.into(),
+            background,
+        }
+    } else {
+        Event::Refused {
+            browser,
+            url: url.into(),
+            reason: Refusal::Scheme.reason().into(),
+        }
+    }
+}
+
+/// Whether a download from `url` is taken. The same set as a page's own frames: what the helper
+/// loads, and the `blob:` a page makes for itself (the ordinary way a page saves what it
+/// produced; it names no address of anyone else's).
+pub fn download_allowed(url: &str) -> bool {
+    scheme_allowed(url, false)
+}
+
+/// Whether a frame of the developer tools' own window may go to `url`. The tools' page is
+/// `devtools://`, and nothing else is ever put in its main frame; inside it, the helper's own
+/// set is as good as it is anywhere else.
+pub fn devtools_frame_allowed(url: &str, main_frame: bool) -> bool {
+    let lower = url.trim_start().to_ascii_lowercase();
+    lower.starts_with("devtools://") || (!main_frame && scheme_allowed(url, false))
+}
+
+/// What an update of the engine's download item says to bateri. A download that broke off is over,
+/// whatever the engine does about it: it keeps such an item "in progress" while it tries to
+/// resume it (measured: `is_interrupted` stays false, the item carries the reason it broke off
+/// and the received count goes back and forth), and bateri was not asked to wait for that. The
+/// way to tell is the reason (`broke_off`) or the state (`interrupted`).
+pub fn download_state(
+    complete: bool,
+    canceled: bool,
+    interrupted: bool,
+    broke_off: bool,
+) -> browser_ipc::message::DownloadState {
+    use browser_ipc::message::DownloadState;
+    if complete {
+        DownloadState::Done
+    } else if canceled || interrupted || broke_off {
+        DownloadState::Canceled
+    } else {
+        DownloadState::Running
+    }
+}
+
+/// Whether a menu answer names a command the menu held: only those are run, so what the engine
+/// has behind its other command numbers (opening `view-source:` among them) cannot be asked for.
+pub fn menu_command_offered(offered: &[i32], command: i32) -> bool {
+    offered.contains(&command)
+}
+
+/// The answer to a question that is still open when its browser closes: the "leave this page?"
+/// question is answered yes (nothing is kept the page would have lost), every other one no.
+pub fn close_answer(kind: browser_ipc::message::DialogKind) -> bool {
+    kind == browser_ipc::message::DialogKind::BeforeUnload
+}
+
 /// A profile folder name: one path component, nothing that climbs out or hides.
 pub fn profile_dir_ok(name: &str) -> bool {
     !name.is_empty()
@@ -162,6 +229,112 @@ mod tests {
         assert!(scheme_allowed("blob:http://a.test/x", false));
         assert!(!scheme_allowed("about:srcdoc", true));
         assert!(!scheme_allowed("file:///", false));
+    }
+
+    #[test]
+    fn downloads_come_from_what_the_helper_loads_and_a_pages_own_blob() {
+        for ok in [
+            "http://a.test/f",
+            "https://a.test/f",
+            "blob:http://a.test/1",
+            "data:text/plain,hi",
+        ] {
+            assert!(download_allowed(ok), "{ok}");
+        }
+        for bad in [
+            "file:///etc/hosts",
+            "ftp://a.test/f",
+            "view-source:http://a.test/",
+            "javascript:1",
+            "chrome://x",
+        ] {
+            assert!(!download_allowed(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_new_window_is_asked_for_only_at_an_address_the_helper_loads() {
+        use browser_ipc::message::Event;
+        assert_eq!(
+            window_event(3, "http://a.test/", true),
+            Event::Window {
+                browser: 3,
+                url: "http://a.test/".into(),
+                background: true
+            }
+        );
+        for bad in [
+            "view-source:http://a.test/",
+            "file:///etc/hosts",
+            "devtools://devtools/x",
+            "chrome://settings",
+        ] {
+            assert_eq!(
+                window_event(3, bad, false),
+                Event::Refused {
+                    browser: 3,
+                    url: bad.into(),
+                    reason: "scheme".into()
+                },
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_developer_tools_stay_on_their_own_page() {
+        assert!(devtools_frame_allowed(
+            "devtools://devtools/bundled/devtools_app.html?x=1",
+            true
+        ));
+        assert!(devtools_frame_allowed(
+            "DEVTOOLS://devtools/bundled/inspector.html",
+            true
+        ));
+        for bad in [
+            "http://a.test/",
+            "https://a.test/",
+            "file:///etc/hosts",
+            "data:text/html,x",
+            "about:blank",
+            "view-source:http://a.test/",
+        ] {
+            assert!(!devtools_frame_allowed(bad, true), "{bad}");
+        }
+        // Inside the page the helper's set holds, and nothing wider.
+        assert!(devtools_frame_allowed("about:blank", false));
+        assert!(devtools_frame_allowed("blob:devtools://x/1", false));
+        assert!(!devtools_frame_allowed("file:///etc/hosts", false));
+        assert!(!devtools_frame_allowed("chrome://settings", false));
+    }
+
+    #[test]
+    fn a_menu_answer_runs_only_what_the_menu_held() {
+        let offered = [100, 102, 113];
+        assert!(menu_command_offered(&offered, 113));
+        assert!(!menu_command_offered(&offered, 132));
+        assert!(!menu_command_offered(&[], 100));
+    }
+
+    #[test]
+    fn a_download_that_broke_off_is_over_even_while_the_engine_calls_it_in_progress() {
+        use browser_ipc::message::DownloadState::*;
+        assert_eq!(download_state(false, false, false, false), Running);
+        assert_eq!(download_state(true, false, false, false), Done);
+        assert_eq!(download_state(false, true, false, false), Canceled);
+        assert_eq!(download_state(false, false, true, false), Canceled);
+        assert_eq!(download_state(false, false, false, true), Canceled);
+        // Finished is finished, whatever it went through on the way.
+        assert_eq!(download_state(true, false, false, true), Done);
+    }
+
+    #[test]
+    fn closing_answers_leave_page_yes_and_the_rest_no() {
+        use browser_ipc::message::DialogKind::*;
+        assert!(close_answer(BeforeUnload));
+        for kind in [Alert, Confirm, Prompt] {
+            assert!(!close_answer(kind));
+        }
     }
 
     #[test]

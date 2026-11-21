@@ -242,6 +242,7 @@ fn events() -> Vec<Event> {
             message: "Name?".into(),
             default_text: "x".into(),
         },
+        Event::DialogVoid { browser: 1, req: 4 },
         Event::FileDialog {
             browser: 1,
             req: 5,
@@ -505,4 +506,13 @@ fn an_older_message_without_a_new_optional_field_still_reads() {
             ignore_cache: false
         }
     );
+}
+
+#[test]
+fn an_event_kind_a_reader_does_not_know_is_an_error_to_it() {
+    // Why `dialog_void` (added after the first fixtures, `PROTOCOL` still 1) needs a bateri built
+    // at this revision: an older reader fails on the kind. Nothing was released at 1 yet.
+    let void: Event = serde_json::from_str(r#"{"e":"dialog_void","browser":1,"req":4}"#).unwrap();
+    assert_eq!(void.name(), "dialog_void");
+    assert!(serde_json::from_str::<Event>(r#"{"e":"from_the_future","browser":1}"#).is_err());
 }

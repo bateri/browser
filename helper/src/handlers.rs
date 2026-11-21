@@ -8,7 +8,7 @@
 use crate::agent::Observer;
 use crate::convert::{NET_ERROR_HEADER, cursor_of, key_kind_of, net_error_code, net_error_name};
 use crate::rules::{self, level_to_ratio};
-use crate::state::{Creds, browser_of, emit, next_req, with, with_entry};
+use crate::state::{Creds, Download, browser_of, emit, next_req, take_where, with, with_entry};
 use crate::{agent, trace};
 use browser_ipc::message::*;
 use browser_ipc::{Frame as PixelFrame, KIND_POPUP, KIND_VIEW, Sent};
@@ -327,21 +327,99 @@ wrap_life_span_handler! {
     }
 }
 
+// The developer tools' own window. It has a client of its own, never the page's `HelperClient`
+// (whose life-span handler would stand for the page itself): what the tools' page does is held to
+// the tools' own page, and a window it asks for is bateri's to decide, like a page's.
+wrap_client! {
+    pub struct ToolsClient {
+        id: u32,
+    }
+
+    impl Client {
+        fn life_span_handler(&self) -> Option<LifeSpanHandler> {
+            Some(ToolsLife::new(self.id))
+        }
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(ToolsRequests::new(self.id))
+        }
+    }
+}
+
+wrap_life_span_handler! {
+    struct ToolsLife {
+        id: u32,
+    }
+
+    impl LifeSpanHandler {
+        fn on_before_popup(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _popup_id: ::std::os::raw::c_int,
+            target_url: Option<&CefString>,
+            _target_frame_name: Option<&CefString>,
+            target_disposition: WindowOpenDisposition,
+            _user_gesture: ::std::os::raw::c_int,
+            _popup_features: Option<&PopupFeatures>,
+            _window_info: Option<&mut WindowInfo>,
+            _client: Option<&mut Option<Client>>,
+            _settings: Option<&mut BrowserSettings>,
+            _extra_info: Option<&mut Option<DictionaryValue>>,
+            _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            // The engine opens no window: the page the tools were opened for asks bateri.
+            ask_window(self.id, &text(target_url), target_disposition == WindowOpenDisposition::NEW_BACKGROUND_TAB);
+            1
+        }
+
+        fn on_after_created(&self, _browser: Option<&mut Browser>) {
+            trace!("the developer tools of browser {} were created", self.id);
+        }
+    }
+}
+
+wrap_request_handler! {
+    struct ToolsRequests {
+        id: u32,
+    }
+
+    impl RequestHandler {
+        fn on_before_browse(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            request: Option<&mut cef::Request>,
+            _user_gesture: ::std::os::raw::c_int,
+            _is_redirect: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            let Some(request) = request else { return 0 };
+            let url = userfree(request.url());
+            let main = frame.map(|f| f.is_main() != 0).unwrap_or(true);
+            trace!("developer tools of browser {}: navigation to {url} (main frame {main})", self.id);
+            if rules::devtools_frame_allowed(&url, main) {
+                return 0;
+            }
+            emit(Event::Refused { browser: self.id, url, reason: "scheme".into() });
+            1
+        }
+
+        fn on_open_urlfrom_tab(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            target_url: Option<&CefString>,
+            target_disposition: WindowOpenDisposition,
+            _user_gesture: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            ask_window(self.id, &text(target_url), target_disposition == WindowOpenDisposition::NEW_BACKGROUND_TAB);
+            1
+        }
+    }
+}
+
 /// A page asked for a new window: told to bateri when the address is one the helper loads.
 fn ask_window(id: u32, url: &str, background: bool) {
-    if rules::scheme_allowed(url, true) {
-        emit(Event::Window {
-            browser: id,
-            url: url.into(),
-            background,
-        });
-    } else {
-        emit(Event::Refused {
-            browser: id,
-            url: url.into(),
-            reason: "scheme".into(),
-        });
-    }
+    emit(rules::window_event(id, url, background));
 }
 
 // Sets the error of a page the proxy answered for a server it could not reach, on the UI thread
@@ -546,6 +624,11 @@ wrap_keyboard_handler! {
     }
 }
 
+/// The engine's "view page source" command number.
+fn view_source_command() -> i32 {
+    sys::cef_menu_id_t::MENU_ID_VIEW_SOURCE as i32
+}
+
 wrap_context_menu_handler! {
     struct Menus {
         id: u32,
@@ -561,6 +644,9 @@ wrap_context_menu_handler! {
             callback: Option<&mut RunContextMenuCallback>,
         ) -> ::std::os::raw::c_int {
             let (Some(params), Some(model), Some(callback)) = (params, model, callback) else { return 0 };
+            // "View source" opens a `view-source:` page, an address the helper never loads: it is
+            // not offered, and `MenuResult` runs only what was.
+            model.remove(view_source_command());
             let mut items = Vec::new();
             for i in 0..model.count() {
                 let kind = model.type_at(i);
@@ -588,7 +674,9 @@ wrap_context_menu_handler! {
             }
             let non_empty = |s: String| (!s.is_empty()).then_some(s);
             let req = next_req();
-            with(|s| s.pending.menus.insert(req, (self.id, callback.clone())));
+            let offered: Vec<i32> = items.iter().filter(|m| !m.separator && m.enabled).map(|m| m.command).collect();
+            let stale = with(|s| s.pending.menus.insert(req, (self.id, callback.clone(), offered)));
+            drop(stale);
             emit(Event::Menu {
                 browser: self.id,
                 req,
@@ -661,7 +749,8 @@ fn ask_dialog(
     callback: JsdialogCallback,
 ) {
     let req = next_req();
-    with(|s| s.pending.dialogs.insert(req, (id, callback)));
+    let stale = with(|s| s.pending.dialogs.insert(req, (id, kind, callback)));
+    drop(stale);
     emit(Event::Dialog {
         browser: id,
         req,
@@ -701,7 +790,8 @@ wrap_dialog_handler! {
             };
             let accept: Vec<String> = accept_filters.map(|l| l.clone().into_iter().collect()).unwrap_or_default();
             let req = next_req();
-            with(|s| s.pending.files.insert(req, (self.id, callback.clone())));
+            let stale = with(|s| s.pending.files.insert(req, (self.id, callback.clone())));
+            drop(stale);
             emit(Event::FileDialog {
                 browser: self.id,
                 req,
@@ -721,13 +811,21 @@ wrap_download_handler! {
     }
 
     impl DownloadHandler {
+        /// A download is taken from the addresses the helper loads (and a page's own `blob:`); one
+        /// from any other is refused, and bateri is told so.
         fn can_download(
             &self,
             _browser: Option<&mut Browser>,
-            _url: Option<&CefString>,
+            url: Option<&CefString>,
             _request_method: Option<&CefString>,
         ) -> ::std::os::raw::c_int {
-            1
+            let url = text(url);
+            trace!("can_download browser={} url={url}", self.id);
+            if rules::download_allowed(&url) {
+                return 1;
+            }
+            emit(Event::Refused { browser: self.id, url, reason: "scheme".into() });
+            0
         }
 
         /// Nothing is written until bateri has said where: the callback waits for its answer, and
@@ -741,10 +839,12 @@ wrap_download_handler! {
         ) -> ::std::os::raw::c_int {
             let (Some(item), Some(callback)) = (download_item, callback) else { return 0 };
             let req = next_req();
-            with(|s| {
-                s.pending.before_download.insert(req, (self.id, callback.clone()));
-                s.pending.downloads.insert(item.id(), (req, None));
+            let stale = with(|s| {
+                let before = s.pending.before_download.insert(req, (self.id, callback.clone()));
+                let running = s.pending.downloads.insert((self.id, item.id()), Download { req, cancel: None });
+                (before, running)
             });
+            drop(stale);
             let size = item.total_bytes();
             emit(Event::Download {
                 browser: self.id,
@@ -764,35 +864,44 @@ wrap_download_handler! {
             callback: Option<&mut DownloadItemCallback>,
         ) {
             let Some(item) = download_item else { return };
-            let item_id = item.id();
-            let done = item.is_complete() != 0;
-            let canceled = item.is_canceled() != 0;
-            let state = if done {
-                DownloadState::Done
-            } else if canceled {
-                DownloadState::Canceled
-            } else {
-                DownloadState::Running
-            };
+            let key = (self.id, item.id());
+            let interrupted = item.is_interrupted() != 0
+                || item.interrupt_reason() != DownloadInterruptReason::NONE;
+            let state = rules::download_state(
+                item.is_complete() != 0,
+                item.is_canceled() != 0,
+                item.is_interrupted() != 0,
+                item.interrupt_reason() != DownloadInterruptReason::NONE,
+            );
             let total = item.total_bytes();
-            let req = with(|s| {
-                let entry = s.pending.downloads.get_mut(&item_id)?;
-                entry.1 = callback.map(|c| c.clone());
-                let req = entry.0;
-                if state != DownloadState::Running {
-                    s.pending.downloads.remove(&item_id);
-                    s.pending.before_download.remove(&req);
+            // What leaves the table is dropped after the borrow: letting go of an engine handle can
+            // call back into a handler.
+            let taken = with(|s| {
+                let download = s.pending.downloads.get_mut(&key)?;
+                let req = download.req;
+                let newest = (state == DownloadState::Running).then(|| callback.as_ref().map(|c| (**c).clone())).flatten();
+                let older = std::mem::replace(&mut download.cancel, newest);
+                if state == DownloadState::Running {
+                    return Some((req, older, Vec::new(), Vec::new()));
                 }
-                Some(req)
+                let finished = take_where(&mut s.pending.downloads, |k, _| *k == key);
+                let asked = s.pending.before_download.remove(&req);
+                Some((req, older, finished, asked.into_iter().collect()))
             });
-            if let Some(req) = req {
-                emit(Event::DownloadProgress {
-                    req,
-                    state,
-                    received: item.received_bytes().max(0) as u64,
-                    total: (total > 0).then_some(total as u64),
-                });
+            let Some((req, older, finished, asked)) = taken else { return };
+            drop(older);
+            drop(finished);
+            drop(asked);
+            if interrupted && state == DownloadState::Canceled && let Some(callback) = callback {
+                // Not resumed: it would be written to disk after bateri was told it is over.
+                callback.cancel();
             }
+            emit(Event::DownloadProgress {
+                req,
+                state,
+                received: item.received_bytes().max(0) as u64,
+                total: (total > 0).then_some(total as u64),
+            });
         }
     }
 }

@@ -163,6 +163,23 @@ fn same_token(a: &str, b: &str) -> bool {
     difference == 0
 }
 
+/// Binds a socket in `dir` under a name no other launch has; the file is made by the bind, so a
+/// name that is taken is never taken over.
+fn bind_unique(dir: &Path) -> io::Result<(UnixListener, PathBuf)> {
+    for _ in 0..8 {
+        let socket = dir.join(format!("helper-{}.sock", &random_token()[..8]));
+        match UnixListener::bind(&socket) {
+            Ok(listener) => return Ok((listener, socket)),
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        "no free socket name in the launch directory",
+    ))
+}
+
 /// What bateri needs to start one helper: the socket it listens on, the key, the mach name its
 /// frames arrive under.
 pub struct Launch {
@@ -173,8 +190,12 @@ pub struct Launch {
 }
 
 impl Launch {
-    /// Makes the socket `dir/helper.sock` (mode `0600`) in `dir`, which must be a directory
-    /// only this user can enter (`0700`; it is created so when missing).
+    /// Makes a socket in `dir` (mode `0600`), `helper-` and eight random hex digits and `.sock`;
+    /// `dir` must be a directory only this user can enter (`0700`; it is created so when
+    /// missing). The name is the launch's own: two launches in one directory (two helpers at
+    /// once, a second one while the first is still being waited for) never share a file, and
+    /// neither takes the other's away. It is short because a unix socket's whole path has to
+    /// fit `sockaddr_un` (104 bytes on macOS).
     pub fn prepare(dir: &Path) -> io::Result<Self> {
         match std::fs::DirBuilder::new().mode(0o700).create(dir) {
             Ok(()) => {}
@@ -188,17 +209,16 @@ impl Launch {
                 format!("{} is open to other users (mode {mode:o})", dir.display()),
             ));
         }
-        let socket = dir.join("helper.sock");
-        let _ = std::fs::remove_file(&socket);
-        let listener = UnixListener::bind(&socket)?;
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
-        // A unix socket path has to fit `sockaddr_un`; bind would have failed otherwise.
-        Ok(Self {
+        let (listener, socket) = bind_unique(dir)?;
+        let launch = Self {
             listener,
             socket,
             key: random_token(),
             mach: format!("{}.{}", crate::mach::NAME_PREFIX, random_token()),
-        })
+        };
+        // `launch` removes its socket when it goes, on any path out of here too.
+        std::fs::set_permissions(&launch.socket, std::fs::Permissions::from_mode(0o600))?;
+        Ok(launch)
     }
 
     /// The helper's command line (after the program): the whole launch contract.
@@ -239,9 +259,7 @@ impl Launch {
     /// connection from any other process is dropped and the wait goes on. The key is spent by this
     /// call whatever happens; the socket file is removed.
     pub fn accept(self, child: u32, timeout: Duration) -> io::Result<Connection> {
-        let result = self.accept_inner(child, timeout);
-        let _ = std::fs::remove_file(&self.socket);
-        result
+        self.accept_inner(child, timeout)
     }
 
     fn accept_inner(&self, child: u32, timeout: Duration) -> io::Result<Connection> {
@@ -317,6 +335,14 @@ impl Launch {
     }
 }
 
+impl Drop for Launch {
+    /// The key is spent and the socket is of no use to anyone else: the file goes with the launch,
+    /// whether it was accepted from, timed out, or never used. It is this launch's own file.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
 enum Refused {
     /// Not the helper bateri started: keep waiting.
     Peer,
@@ -358,5 +384,64 @@ impl Client {
             key: key.into(),
         })?;
         Ok(Self { events, commands })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn directory(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("bf-ch-{}-{label}", std::process::id()))
+    }
+
+    #[test]
+    fn two_launches_in_one_directory_keep_their_own_sockets() {
+        let dir = directory("two");
+        let first = Launch::prepare(&dir).unwrap();
+        let second = Launch::prepare(&dir).unwrap();
+        assert_ne!(first.socket(), second.socket());
+        // The first one gives up (nobody connects): the end of it must not take the second's
+        // socket away, which is what a shared `helper.sock` did.
+        let late = first.accept(1, Duration::from_millis(50));
+        assert_eq!(late.err().map(|e| e.kind()), Some(io::ErrorKind::TimedOut));
+        assert!(second.socket().exists());
+        UnixStream::connect(second.socket()).expect("the second launch still takes connections");
+        drop(second);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_launch_that_is_dropped_leaves_no_socket_and_a_stale_file_is_not_taken_over() {
+        let dir = directory("drop");
+        let launch = Launch::prepare(&dir).unwrap();
+        let socket = launch.socket().to_path_buf();
+        assert!(socket.exists());
+        drop(launch);
+        assert!(!socket.exists());
+        // A file someone else left under a name is not this launch's to bind or remove.
+        std::fs::write(dir.join("helper-aaaaaaaa.sock"), "x").unwrap();
+        let other = Launch::prepare(&dir).unwrap();
+        assert!(dir.join("helper-aaaaaaaa.sock").exists());
+        drop(other);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_socket_name_is_short_and_the_key_and_mach_name_are_fresh() {
+        let dir = directory("short");
+        let a = Launch::prepare(&dir).unwrap();
+        let b = Launch::prepare(&dir).unwrap();
+        let name = a
+            .socket()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(name.starts_with("helper-") && name.ends_with(".sock") && name.len() == 20);
+        assert_ne!(a.key(), b.key());
+        assert_ne!(a.mach_name(), b.mach_name());
+        drop((a, b));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
