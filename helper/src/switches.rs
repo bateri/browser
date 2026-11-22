@@ -64,6 +64,7 @@ pub const WEBRTC_POLICY: &str = "disable_non_proxied_udp";
 pub enum Pref {
     Str(&'static str),
     Int(i32),
+    Bool(bool),
 }
 
 /// `net.network_prediction_options`: Chromium's `kDisabled`. It is the switch DNS prefetching and
@@ -78,6 +79,11 @@ pub const PREFS: &[(&str, Pref)] = &[
         "net.network_prediction_options",
         Pref::Int(NETWORK_PREDICTION_DISABLED),
     ),
+    // Safe Browsing, which `SafeBrowsing` in `DISABLED_FEATURES` does not turn off: on, it holds
+    // every finished download back while a utility process looks into the file and a report goes
+    // to Google, which the proxy turns away (it carries no profile's identity). On a busy machine
+    // that took seconds, up to about 7 (measured), before bateri heard the download was done.
+    ("safebrowsing.enabled", Pref::Bool(false)),
 ];
 
 /// Every switch name used, for a check against the engine's binary (the tests').
@@ -131,5 +137,10 @@ mod tests {
             "webrtc.ip_handling_policy",
             Pref::Str("disable_non_proxied_udp")
         )));
+    }
+
+    #[test]
+    fn safe_browsing_is_held_off_by_its_preference() {
+        assert!(PREFS.contains(&("safebrowsing.enabled", Pref::Bool(false))));
     }
 }

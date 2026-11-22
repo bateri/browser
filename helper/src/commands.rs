@@ -297,10 +297,10 @@ wrap_request_context_handler! {
 }
 
 /// Holds a request context to the preferences `switches::PREFS` names (WebRTC's UDP only through
-/// the proxy, no DNS prefetching) and reads each back: what counts is the value in force. The
-/// first is also on the command line, which decides it (a preference the command line decides
-/// refuses to be set, and is right); the second is only here. A value that is not in force is an
-/// error of the context, and no browser is opened in it.
+/// the proxy, no DNS prefetching, no Safe Browsing) and reads each back: what counts is the value
+/// in force. The first is also on the command line, which decides it (a preference the command
+/// line decides refuses to be set, and is right); the others are only here. A value that is not in
+/// force is an error of the context, and no browser is opened in it.
 fn harden(context: &RequestContext) -> Result<(), String> {
     for (name, want) in switches::PREFS {
         let key: CefString = (*name).into();
@@ -316,6 +316,7 @@ fn harden(context: &RequestContext) -> Result<(), String> {
         match want {
             switches::Pref::Str(text) => value.set_string(Some(&(*text).into())),
             switches::Pref::Int(number) => value.set_int(*number),
+            switches::Pref::Bool(on) => value.set_bool(*on as _),
         };
         // A non-empty `error`: cef-rs passes an empty string as a null pointer and the engine then
         // fails the call without a word.
@@ -337,6 +338,10 @@ fn pref_is(context: &RequestContext, key: &CefString, want: switches::Pref) -> b
     match want {
         switches::Pref::Str(text) => CefString::from(&value.string()).to_string() == text,
         switches::Pref::Int(number) => value.int() == number,
+        // A value of another kind reads as false: only a bool counts.
+        switches::Pref::Bool(on) => {
+            value.get_type() == ValueType::BOOL && (value.bool() != 0) == on
+        }
     }
 }
 
