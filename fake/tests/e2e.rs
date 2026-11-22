@@ -3516,6 +3516,48 @@ fn a_named_profile_keeps_its_session_cookies_when_the_helper_ends_and_starts_aga
 
 #[test]
 #[ignore]
+fn a_session_cookie_is_kept_also_when_its_profile_is_the_one_the_engine_last_used() {
+    let root = scratch("session-cookies-last-used");
+    // The engine writes down the profile a window was last used in (bateri's Pi profile is named
+    // there on the machine this was found on), and each start loads that profile first, as the
+    // engine's own, before any request context exists. The context made for its folder afterwards
+    // is the engine's own context, with the engine's settings and not the ones `create_context`
+    // gives, so the settings of the engine must keep the cookies of the session too, or that
+    // profile's preferences say "a new tab" at the end of every run and the next start finds no
+    // cookie of the session. The fake does not put a window in front, so the note is written here.
+    std::fs::write(
+        root.join("Local State"),
+        "{\"profile\":{\"last_used\":\"pa\"}}",
+    )
+    .unwrap();
+    let run = |go: bool| -> Option<String> {
+        let mut fake = Fake::start_with(Options {
+            root: Some(root.clone()),
+            ..Default::default()
+        });
+        fake.proxy.respond(profile_site);
+        fake.open(1, profile("a", Some("pa")), 200, 100, 1.0);
+        if go {
+            fake.go(1, "http://site.test/set");
+        }
+        let records = fake.profile_read(1);
+        assert_eq!(fake.quit(), Some(0));
+        cookie_named(&records, "tmp").map(|c| c.value.clone())
+    };
+    assert_eq!(run(true).as_deref(), Some("2"));
+    // Each start after that must find the cookie.
+    for n in 2..=4 {
+        assert_eq!(
+            run(false).as_deref(),
+            Some("2"),
+            "the session cookie is gone at the start number {n}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+#[ignore]
 fn changes_come_as_records_and_what_was_written_does_not_come_back() {
     let mut fake = Fake::start();
     fake.proxy.respond(profile_site);

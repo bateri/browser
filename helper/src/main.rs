@@ -170,6 +170,12 @@ fn main() {
         // Chromium's own switches are off: nothing on the command line reaches the engine.
         command_line_args_disabled: 1,
         root_cache_path: root.to_string_lossy().as_ref().into(),
+        // The engine loads the profile it last had a window in as its own, at its start and before
+        // any request context exists, and a context made later for that folder is the engine's
+        // own, with these settings and not the ones `create_context` gives. Without this, that
+        // profile's preferences say "a new tab" at every start and its cookies of the session
+        // are thrown away (see `create_context`, where a named profile keeps them).
+        persist_session_cookies: 1,
         log_file: root.join("engine.log").to_string_lossy().as_ref().into(),
         log_severity: LogSeverity::WARNING,
         ..Default::default()
