@@ -219,6 +219,9 @@ pub struct Entry {
     /// The script the protocol runs before every new document, which puts waiting Local Storage
     /// items in (`sync`): its name, to take it away.
     pub seed_script: Option<String>,
+    /// Counts the seed scripts that were asked for: the name an answer brings is the script's
+    /// only if no newer one was asked for meanwhile (`sync`), or it is taken away.
+    pub seed_gen: u64,
     /// The questions of `Command::CanScroll` the page has not answered, by call number: the `req`
     /// each answer is owed to.
     pub scroll_asks: HashMap<i32, u32>,

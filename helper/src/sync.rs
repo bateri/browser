@@ -52,8 +52,9 @@ pub enum Call {
     VisitItems { origin: String },
     /// A part of a `ProfileWrite` that matters only by succeeding.
     Part { req: Option<u32> },
-    /// The registration of a seed script; the answer names it.
-    AddScript { req: Option<u32> },
+    /// The registration of a seed script; the answer names it. `generation` is the browser's
+    /// count when it was asked for: an answer to an older one names a script that is taken away.
+    AddScript { req: Option<u32>, generation: u64 },
 }
 
 enum Op {
@@ -194,15 +195,25 @@ pub fn browser_ready(id: u32) {
             p.and_then(|p| records::seed_script(&p.seeds)),
         )
     });
-    if watching {
+    // The page domain is what makes the engine run a script before a document's own: it is on
+    // for a script as well as for a watch.
+    if watching || source.is_some() {
         ensure_domains(&dir);
     }
     if let Some(source) = source {
+        let generation = with_entry(id, |e| {
+            e.seed_gen += 1;
+            e.seed_gen
+        })
+        .unwrap_or(0);
         send(
             id,
             "Page.addScriptToEvaluateOnNewDocument",
             json!({"source": source}),
-            Call::AddScript { req: None },
+            Call::AddScript {
+                req: None,
+                generation,
+            },
         );
     }
 }
@@ -220,7 +231,10 @@ pub fn browser_gone(id: u32) {
                 for dir in &dirs {
                     sync(|s| {
                         if let Some(p) = s.profiles.get_mut(dir) {
+                            // The poll that was out is not coming back: the next one is asked
+                            // for, or the profile's cookies are never read again.
                             p.polling = false;
+                            p.poll_at = Some(Instant::now());
                         }
                     });
                 }
@@ -228,7 +242,7 @@ pub fn browser_gone(id: u32) {
             Call::ReadCookies { req }
             | Call::ReadItems { req, .. }
             | Call::Part { req: Some(req) }
-            | Call::AddScript { req: Some(req) } => {
+            | Call::AddScript { req: Some(req), .. } => {
                 call_done(req, Some("the browser was closed".into()));
             }
             _ => {}
@@ -523,6 +537,13 @@ fn reseed(dir: &str, req: Option<u32>) -> usize {
     });
     let mut sent = 0;
     for b in browsers_of(dir) {
+        // Whatever script was asked for before this is out of date, whether or not it has been
+        // named yet.
+        let generation = with_entry(b, |e| {
+            e.seed_gen += 1;
+            e.seed_gen
+        })
+        .unwrap_or(0);
         if let Some(old) = with_entry(b, |e| e.seed_script.take()).flatten()
             && send(
                 b,
@@ -538,7 +559,7 @@ fn reseed(dir: &str, req: Option<u32>) -> usize {
                 b,
                 "Page.addScriptToEvaluateOnNewDocument",
                 json!({"source": source}),
-                Call::AddScript { req },
+                Call::AddScript { req, generation },
             )
         {
             sent += 1;
@@ -744,14 +765,39 @@ pub fn on_result(id: u32, message_id: i32, success: bool, bytes: &[u8]) -> bool 
             }
         }
         Call::Part { req } => {
+            if !success && let Some(dir) = dir_of(id) {
+                // What was written was put in the base before the browser took it: a call that
+                // failed leaves a base that has what the browser lacks, and the next read would
+                // call that a deletion by the page and say so to every other computer. The bases
+                // are taken again from the browser as it is.
+                sync(|s| {
+                    if let Some(p) = s.profiles.get_mut(&dir) {
+                        p.cookies = None;
+                        p.storage.clear();
+                        p.storage_read.clear();
+                    }
+                });
+            }
             if let Some(req) = req {
                 call_done(req, (!success).then(why));
             }
         }
-        Call::AddScript { req } => {
+        Call::AddScript { req, generation } => {
             if success && let Some(script) = json["identifier"].as_str() {
                 let script = script.to_string();
-                with_entry(id, |e| e.seed_script = Some(script));
+                let current = with_entry(id, |e| e.seed_gen == generation).unwrap_or(false);
+                if current {
+                    with_entry(id, |e| e.seed_script = Some(script));
+                } else {
+                    // A newer script was asked for while this one was on its way: this one would
+                    // put the older items back on every page that opens.
+                    send(
+                        id,
+                        "Page.removeScriptToEvaluateOnNewDocument",
+                        json!({"identifier": script}),
+                        Call::Quiet,
+                    );
+                }
             }
             if let Some(req) = req {
                 call_done(req, (!success).then(why));
@@ -907,6 +953,11 @@ fn look_at_folders(dir: &str, now: Instant) {
     if ready.is_empty() && gone.is_empty() {
         return;
     }
+    // A change nobody can carry is left as it is: the folders are looked at again when a browser
+    // is there, or the change would be taken for the base and never said.
+    let Some(browser) = browsers_of(dir).first().copied() else {
+        return;
+    };
     let (stage_name, stage) = new_stage();
     let mut records = Vec::new();
     for name in ready {
@@ -939,10 +990,6 @@ fn look_at_folders(dir: &str, now: Instant) {
         let _ = std::fs::remove_dir_all(&stage);
         return;
     }
-    let Some(browser) = browsers_of(dir).first().copied() else {
-        let _ = std::fs::remove_dir_all(&stage);
-        return;
-    };
     emit(Event::ProfileChanged {
         browser,
         records,

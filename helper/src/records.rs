@@ -603,7 +603,8 @@ pub fn idb_record(origin: &str, major: u16, files: Vec<IndexedDbFile>) -> Record
 }
 
 /// Puts the files a record names from `stage/<origin>/` in place of the origin's folders in the
-/// profile. The new folders are made beside the old and swapped in, so a failure leaves the old.
+/// profile. The new folders are made beside the old and swapped in once both are whole, so a
+/// failure leaves the old.
 pub fn idb_copy_in(
     profile: &Path,
     origin: &str,
@@ -619,28 +620,80 @@ pub fn idb_copy_in(
     let idb = idb_dir(profile);
     make_dir(&idb)?;
     let source = stage.join(origin);
-    for (prefix, suffix) in [("leveldb", LEVELDB), ("blob", BLOB)] {
-        let target = idb.join(format!("{origin}{suffix}"));
-        let fresh = idb.join(format!(".{origin}{suffix}.new"));
-        let _ = std::fs::remove_dir_all(&fresh);
-        make_dir(&fresh)?;
-        let mut any = false;
-        for file in files
-            .iter()
-            .filter(|f| f.path.split('/').next() == Some(prefix))
-        {
-            let rel = file.path.split_once('/').map(|(_, r)| r).unwrap_or("");
-            copy_file(&source.join(&file.path), &fresh.join(rel))?;
-            any = true;
-        }
-        let _ = std::fs::remove_dir_all(&target);
-        if any || prefix == "leveldb" {
-            std::fs::rename(&fresh, &target)?;
-        } else {
+    // Both new folders are made before either old one is touched: a file that is missing or a disk
+    // that is full leaves what the profile had (a store whose log is new and whose blobs are the
+    // old ones is a broken one).
+    let mut ready: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
+    let made = (|| -> io::Result<()> {
+        for (prefix, suffix) in [("leveldb", LEVELDB), ("blob", BLOB)] {
+            let target = idb.join(format!("{origin}{suffix}"));
+            let fresh = idb.join(format!(".{origin}{suffix}.new"));
             let _ = std::fs::remove_dir_all(&fresh);
+            make_dir(&fresh)?;
+            let mut any = false;
+            ready.push((target, fresh, false));
+            for file in files
+                .iter()
+                .filter(|f| f.path.split('/').next() == Some(prefix))
+            {
+                let rel = file.path.split_once('/').map(|(_, r)| r).unwrap_or("");
+                copy_file(
+                    &source.join(&file.path),
+                    &ready[ready.len() - 1].1.join(rel),
+                )?;
+                any = true;
+            }
+            if let Some(last) = ready.last_mut() {
+                last.2 = any || prefix == "leveldb";
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e) = made {
+        for (_, fresh, _) in &ready {
+            let _ = std::fs::remove_dir_all(fresh);
+        }
+        return Err(e);
+    }
+    // The swap: each old folder is put aside, the new one in its place, and the old ones go last.
+    let mut aside: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (target, fresh, keep) in &ready {
+        let old = target.with_file_name(format!(
+            ".{}.old",
+            target.file_name().and_then(|n| n.to_str()).unwrap_or("idb")
+        ));
+        let _ = std::fs::remove_dir_all(&old);
+        if target.exists() {
+            if let Err(e) = std::fs::rename(target, &old) {
+                undo_swap(&aside, &ready);
+                return Err(e);
+            }
+            aside.push((target.clone(), old));
+        }
+        if *keep {
+            if let Err(e) = std::fs::rename(fresh, target) {
+                undo_swap(&aside, &ready);
+                return Err(e);
+            }
+        } else {
+            let _ = std::fs::remove_dir_all(fresh);
         }
     }
+    for (_, old) in aside {
+        let _ = std::fs::remove_dir_all(old);
+    }
     Ok(())
+}
+
+/// A swap that did not finish: what was put aside comes back and what was made is taken away.
+fn undo_swap(aside: &[(PathBuf, PathBuf)], ready: &[(PathBuf, PathBuf, bool)]) {
+    for (target, old) in aside {
+        let _ = std::fs::remove_dir_all(target);
+        let _ = std::fs::rename(old, target);
+    }
+    for (_, fresh, _) in ready {
+        let _ = std::fs::remove_dir_all(fresh);
+    }
 }
 
 /// Removes an origin's folders from the profile.
@@ -883,6 +936,43 @@ mod tests {
             size: 1,
         }];
         assert!(idb_copy_in(&other, "https_x.test_0", &stage, &bad).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_folder_that_cannot_be_put_in_whole_leaves_the_one_the_profile_had() {
+        let root = std::env::temp_dir().join(format!("records-idb-swap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let profile = root.join("p");
+        let level = profile.join("IndexedDB/https_x.test_0.indexeddb.leveldb");
+        std::fs::create_dir_all(&level).unwrap();
+        std::fs::write(level.join("000003.log"), b"old log").unwrap();
+        let blob = profile.join("IndexedDB/https_x.test_0.indexeddb.blob/1/00");
+        std::fs::create_dir_all(&blob).unwrap();
+        std::fs::write(blob.join("1"), b"old blob").unwrap();
+        // The stage has the new log and not the blob the record names.
+        let stage = root.join("stage");
+        std::fs::create_dir_all(stage.join("https_x.test_0/leveldb")).unwrap();
+        std::fs::write(stage.join("https_x.test_0/leveldb/000003.log"), b"new log").unwrap();
+        let files = [
+            IndexedDbFile {
+                path: "leveldb/000003.log".into(),
+                size: 7,
+            },
+            IndexedDbFile {
+                path: "blob/1/00/1".into(),
+                size: 8,
+            },
+        ];
+        assert!(idb_copy_in(&profile, "https_x.test_0", &stage, &files).is_err());
+        assert_eq!(std::fs::read(level.join("000003.log")).unwrap(), b"old log");
+        assert_eq!(std::fs::read(blob.join("1")).unwrap(), b"old blob");
+        // Nothing of the attempt is left beside them.
+        let left: Vec<_> = std::fs::read_dir(profile.join("IndexedDB"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left.len(), 2, "{left:?}");
         let _ = std::fs::remove_dir_all(root);
     }
 }
