@@ -11,7 +11,7 @@ use crate::rules::{self, level_to_ratio};
 use crate::state::{
     Creds, Download, OpenMenu, browser_of, emit, next_req, take_where, with, with_entry,
 };
-use crate::{agent, trace};
+use crate::{agent, clear, state, trace};
 use browser_ipc::message::*;
 use browser_ipc::{Frame as PixelFrame, KIND_POPUP, KIND_VIEW, Sent};
 use cef::*;
@@ -219,7 +219,9 @@ wrap_display_handler! {
 
         fn on_address_change(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, url: Option<&CefString>) {
             if frame.is_some_and(|f| f.is_main() != 0) {
-                with_entry(self.id, |e| e.url = text(url));
+                let url = text(url);
+                clear::note_address(self.id, &url);
+                with_entry(self.id, |e| e.url = url);
                 push_state(self.id);
             }
         }
@@ -282,8 +284,16 @@ wrap_load_handler! {
             if code == -3 || !frame.is_some_and(|f| f.is_main() != 0) {
                 return;
             }
+            let url = text(failed_url);
+            let host = clear::host_of_origin(&url).map(str::to_ascii_lowercase);
             with_entry(self.id, |e| {
-                e.error = Some(LoadError { url: text(failed_url), code, message: text(error_text) })
+                // A certificate error is one the person can go on from only if the helper kept the
+                // certificate it was refused for (`Command::Proceed`).
+                let certificate = host
+                    .and_then(|h| e.rejected.get(&h))
+                    .and_then(|r| clear::certificate_reason(code, r.self_signed))
+                    .map(str::to_string);
+                e.error = Some(LoadError { url, code, message: text(error_text), certificate })
             });
             push_state(self.id);
         }
@@ -443,6 +453,7 @@ wrap_task! {
                     url: self.url.clone(),
                     code: self.code,
                     message: net_error_name(self.code),
+                    certificate: None,
                 })
             });
             push_state(self.id);
@@ -547,6 +558,51 @@ wrap_request_handler! {
         ) -> ::std::os::raw::c_int {
             ask_window(self.id, &text(target_url), target_disposition == WindowOpenDisposition::NEW_BACKGROUND_TAB);
             1
+        }
+
+        /// The engine did not trust a site's certificate. A host the person went on with (for this
+        /// certificate, in this profile) goes on; any other fails the load, and what was refused is
+        /// kept for `Command::Proceed` to take (the card says why, `on_load_error`).
+        fn on_certificate_error(
+            &self,
+            _browser: Option<&mut Browser>,
+            cert_error: Errorcode,
+            request_url: Option<&CefString>,
+            ssl_info: Option<&mut Sslinfo>,
+            callback: Option<&mut Callback>,
+        ) -> ::std::os::raw::c_int {
+            let url = text(request_url);
+            let Some(host) = clear::host_of_origin(&url).map(str::to_ascii_lowercase) else { return 0 };
+            let certificate = ssl_info.and_then(|i| i.x509_certificate());
+            let der = certificate
+                .as_ref()
+                .and_then(|c| c.derencoded())
+                .map(|b| {
+                    let mut bytes = vec![0u8; b.size()];
+                    b.data(Some(&mut bytes), 0);
+                    bytes
+                })
+                .unwrap_or_default();
+            let name_of = |p: Option<X509CertPrincipal>| p.map(|p| userfree(p.display_name()));
+            let self_signed = certificate.as_ref().is_some_and(|c| {
+                let (subject, issuer) = (name_of(c.subject()), name_of(c.issuer()));
+                subject.is_some() && subject == issuer
+            });
+            let code = cert_error.get_raw();
+            trace!("certificate error {code} for {url}: {} bytes of certificate", der.len());
+            let accepted = with(|s| {
+                let context = s.entries.get(&self.id).map(|e| e.context.clone())?;
+                Some(s.contexts.get(&context)?.accepted.contains(&(host.clone(), der.clone())))
+            })
+            .unwrap_or(false);
+            if accepted {
+                if let Some(callback) = callback {
+                    callback.cont();
+                }
+                return 1;
+            }
+            with_entry(self.id, |e| e.rejected.insert(host, state::Rejected { der, self_signed }));
+            0
         }
 
         /// The proxy asked who this is. The answer is the profile's own and the same for every

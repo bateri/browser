@@ -55,6 +55,8 @@ pub enum Call {
     /// The registration of a seed script; the answer names it. `generation` is the browser's
     /// count when it was asked for: an answer to an older one names a script that is taken away.
     AddScript { req: Option<u32>, generation: u64 },
+    /// A call of the operations that empty a profile (`clear`).
+    Clear { req: u32, what: crate::clear::Clear },
 }
 
 enum Op {
@@ -170,6 +172,56 @@ fn send(id: u32, method: &'static str, params: Value, call: Call) -> bool {
     sent
 }
 
+/// `send` for the operations of `clear`.
+pub fn send_call(id: u32, method: &'static str, params: Value, call: Call) -> bool {
+    send(id, method, params, call)
+}
+
+/// What the base of the profile `dir` holds of Local Storage for origins of `host`: the owner and
+/// the keys.
+pub fn storage_base(dir: Option<&str>, host: &str) -> Vec<(String, Vec<String>)> {
+    let Some(dir) = dir else { return Vec::new() };
+    sync(|s| {
+        let Some(p) = s.profiles.get(dir) else {
+            return Vec::new();
+        };
+        p.storage
+            .iter()
+            .filter(|(owner, _)| {
+                crate::clear::host_of_origin(owner).is_some_and(|h| h.eq_ignore_ascii_case(host))
+            })
+            .map(|(owner, items)| (owner.clone(), items.keys().cloned().collect()))
+            .collect()
+    })
+}
+
+/// What was deleted is taken out of the base of the profile `dir`, so that its watch does not
+/// report it as gone a second time.
+pub fn forget(
+    dir: &str,
+    cookies: &[records::CookieId],
+    storage: &[(String, Vec<String>)],
+    folders: &[String],
+) {
+    sync(|s| {
+        let Some(p) = s.profiles.get_mut(dir) else {
+            return;
+        };
+        if let Some(base) = p.cookies.as_mut() {
+            for cookie in cookies {
+                base.remove(cookie);
+            }
+        }
+        for (owner, _) in storage {
+            p.storage.remove(owner);
+        }
+        for name in folders {
+            p.idb.remove(name);
+            p.idb_moving.remove(name);
+        }
+    });
+}
+
 /// The protocol's storage and network events are asked for in every browser of the profile.
 fn ensure_domains(dir: &str) {
     for id in browsers_of(dir) {
@@ -245,6 +297,7 @@ pub fn browser_gone(id: u32) {
             | Call::AddScript { req: Some(req), .. } => {
                 call_done(req, Some("the browser was closed".into()));
             }
+            Call::Clear { req, .. } => crate::clear::call_lost(req, "the browser was closed"),
             _ => {}
         }
     }
@@ -665,6 +718,7 @@ pub fn on_result(id: u32, message_id: i32, success: bool, bytes: &[u8]) -> bool 
     trace!("sync {id}#{message_id} -> ok={success}");
     match call {
         Call::Quiet => {}
+        Call::Clear { req, what } => crate::clear::on_result(id, req, what, success, &json),
         Call::PollCookies => {
             let Some(dir) = dir_of(id) else { return true };
             let changes = sync(|s| {

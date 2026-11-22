@@ -169,7 +169,23 @@ pub struct Context {
     pub users: u32,
     /// Opens waiting for the context to come up.
     pub waiting: Vec<u32>,
+    /// The certificates the person went on with, by host name and the certificate's bytes: for as
+    /// long as the helper runs, never written down (`clear::proceed`).
+    pub accepted: std::collections::HashSet<(String, Vec<u8>)>,
+    /// The origins the profile has been to in this run (`clear::note_address`).
+    pub origins: std::collections::BTreeSet<String>,
 }
+
+/// A certificate the engine did not trust, as `on_certificate_error` was told of it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Rejected {
+    pub der: Vec<u8>,
+    /// The certificate names itself as its issuer.
+    pub self_signed: bool,
+}
+
+/// The most console lines a browser keeps.
+pub const CONSOLE_LINES: usize = 500;
 
 /// What a new search needs to ask for its first match.
 pub struct FindStart {
@@ -199,6 +215,10 @@ pub struct Entry {
     pub can_forward: bool,
     pub status: String,
     pub error: Option<LoadError>,
+    /// The certificates refused, by the host name they were refused for (the latest of each).
+    pub rejected: HashMap<String, Rejected>,
+    /// The last lines of the page's console, oldest first (`CONSOLE_LINES`).
+    pub console: std::collections::VecDeque<String>,
     pub found: Option<Found>,
     /// A new search was started and has not selected its first match yet.
     pub find_activate: Option<FindStart>,

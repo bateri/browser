@@ -1,0 +1,18 @@
+{
+  "e": "state",
+  "browser": 1,
+  "url": "https://localhost:8443/",
+  "title": "Privacy error",
+  "loading": false,
+  "can_back": false,
+  "can_forward": false,
+  "status": "",
+  "zoom": 1.0,
+  "error": {
+    "url": "https://localhost:8443/",
+    "code": -202,
+    "message": "ERR_CERT_AUTHORITY_INVALID",
+    "certificate": "self-signed"
+  },
+  "found": null
+}

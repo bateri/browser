@@ -1,0 +1,22 @@
+{
+  "e": "site_cleared",
+  "browser": 1,
+  "req": 31,
+  "records": [
+    {
+      "kind": "cookie",
+      "domain": "localhost",
+      "path": "/",
+      "name": "sid"
+    },
+    {
+      "kind": "local_storage",
+      "origin": "http://localhost:3000/",
+      "key": "token"
+    },
+    {
+      "kind": "indexed_db",
+      "origin": "http_localhost_3000"
+    }
+  ]
+}

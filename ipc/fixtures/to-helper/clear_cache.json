@@ -1,0 +1,6 @@
+{
+  "t": "clear_cache",
+  "browser": 1,
+  "req": 30,
+  "origin": "http://localhost:3000"
+}

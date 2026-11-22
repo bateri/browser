@@ -10,7 +10,7 @@ use crate::state::{
     self, Context, Creds, Entry, FindStart, Fired, OpenMenu, State, browser_of, emit, emit_error,
     take_where, with, with_entry,
 };
-use crate::{agent, keys, rules, switches, sync, trace};
+use crate::{agent, clear, keys, rules, switches, sync, trace};
 use browser_ipc::Command;
 use browser_ipc::message::{Button, DownloadState, EditAction, Event, KeyKind, MouseKind, Profile};
 use cef::*;
@@ -266,6 +266,8 @@ fn create_context(profile: &Profile) -> bool {
                 initialized: false,
                 users: 0,
                 waiting: Vec::new(),
+                accepted: Default::default(),
+                origins: Default::default(),
             },
         )
     });
@@ -423,6 +425,7 @@ pub fn created(id: u32, browser: Browser) {
     .unwrap_or_default();
     emit(Event::Opened { browser: id });
     push_state(id);
+    crate::console::enable(id);
     sync::browser_ready(id);
     for command in queued {
         apply(id, &browser, command);
@@ -802,6 +805,9 @@ fn apply(id: u32, browser: &Browser, command: Command) {
             }
         }
         Command::Agent { req, op, .. } => agent::start(id, req, op),
+        Command::Proceed { .. } => clear::proceed(id),
+        Command::ClearCache { req, origin, .. } => clear::cache(id, req, origin),
+        Command::ClearSiteData { req, host, .. } => clear::site(id, req, host),
         Command::ProfileRead { req, .. } => sync::read(id, req),
         Command::ProfileWrite { req, records, .. } => sync::write(id, req, records),
         Command::ProfileWatch { on, .. } => sync::watch(id, on),

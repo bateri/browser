@@ -5,8 +5,10 @@
 //! process, and it never starts without the key bateri gave it.
 
 mod agent;
+mod clear;
 mod commands;
 mod config;
+mod console;
 mod convert;
 mod handlers;
 mod keys;

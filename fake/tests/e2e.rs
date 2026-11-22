@@ -3745,3 +3745,358 @@ fn a_watched_profile_reports_its_indexed_db_once_it_lies_still() {
     );
     assert_eq!(fake.quit(), Some(0));
 }
+
+#[test]
+#[ignore]
+fn a_certificate_the_engine_does_not_trust_fails_with_its_reason_and_goes_on_when_told() {
+    let mut fake = Fake::start();
+    let site = browser_fake::tls_site::TlsSite::start("secure.test");
+    fake.proxy.tunnel("secure.test", site.port);
+    fake.open(1, profile("a", None), 400, 300, 1.0);
+    fake.send(Command::Navigate {
+        browser: 1,
+        url: "https://secure.test/".into(),
+    });
+    let state = fake.state_where(1, |s| s.error.is_some() && !s.loading);
+    let error = state.error.expect("the load failed");
+    assert_eq!(error.url, "https://secure.test/");
+    assert_eq!(error.code, -202);
+    assert_eq!(error.certificate.as_deref(), Some("self-signed"));
+    assert!(site.requests().is_empty(), "nothing reached the server");
+    // Going on accepts that certificate for the host and loads the page again, with its own
+    // requests: a fetch and a WebSocket to the host work too.
+    fake.send(Command::Proceed { browser: 1 });
+    fake.title_is(1, "secure fetch=pong ws=hello");
+    let state = fake.state_where(1, |s| s.title.starts_with("secure"));
+    assert!(state.error.is_none(), "{state:?}");
+    assert_eq!(
+        site.requests()
+            .iter()
+            .filter(|p| *p == "/ping" || *p == "/ws")
+            .count(),
+        2
+    );
+    // The decision belongs to the profile: another browser of it goes straight in, another
+    // profile is asked again.
+    fake.open(2, profile("a", None), 400, 300, 1.0);
+    fake.go(2, "https://secure.test/");
+    fake.title_is(2, "secure fetch=pong ws=hello");
+    fake.open(3, profile("b", None), 400, 300, 1.0);
+    fake.send(Command::Navigate {
+        browser: 3,
+        url: "https://secure.test/".into(),
+    });
+    let other = fake.state_where(3, |s| s.error.is_some() && !s.loading);
+    assert_eq!(
+        other.error.and_then(|e| e.certificate).as_deref(),
+        Some("self-signed")
+    );
+}
+
+#[test]
+#[ignore]
+fn the_consoles_last_lines_are_read_without_running_anything_in_the_page() {
+    let mut fake = Fake::start();
+    fake.proxy.respond(|seen| match seen.path.as_str() {
+        "/many" => Reply::html(
+            "<title>many</title><script>for (let i = 0; i < 600; i++) console.log('line ' + i);</script>",
+        ),
+        _ => Reply::html(
+            "<title>console</title><script>\
+             console.log({a: 1, b: [2, 3]}); console.debug('detail'); console.warn('careful');\
+             console.error('boom'); setTimeout(() => { throw new Error('uncaught one'); }, 10);\
+             </script>",
+        ),
+    });
+    fake.open(1, profile("a", None), 400, 300, 1.0);
+    fake.go(1, "http://page.test/");
+    std::thread::sleep(Duration::from_millis(500));
+    let AgentOutput::Text { text, truncated } = fake.agent(1, AgentOp::Console) else {
+        panic!("the console is text");
+    };
+    assert!(!truncated);
+    let lines: Vec<&str> = text.lines().collect();
+    // An object is shown by what it holds, not as `[object Object]`.
+    assert!(
+        lines[0].starts_with("[log] {a: 1, b: Array(2)} (http://page.test/:"),
+        "{text}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("[warning] careful (http://page.test/")),
+        "{text}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("[error] boom (")),
+        "{text}"
+    );
+    assert!(
+        text.contains("[error] Uncaught Error: uncaught one"),
+        "{text}"
+    );
+    // Only the last 500 lines are kept, the oldest go first.
+    fake.go(1, "http://page.test/many");
+    std::thread::sleep(Duration::from_millis(500));
+    let AgentOutput::Text { text, .. } = fake.agent(1, AgentOp::Console) else {
+        panic!("the console is text");
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 500, "{}", lines.len());
+    assert!(lines[0].starts_with("[log] line 100 ("), "{}", lines[0]);
+    assert!(lines[499].starts_with("[log] line 599 ("), "{}", lines[499]);
+}
+
+/// A server for the tests of what a site keeps: a script the engine may cache for an hour, a page
+/// that registers a service worker (which fills a Cache Storage) and sets a cookie, and a page
+/// that says what the profile holds of them.
+fn keeping_site(fake: &Fake) {
+    fake.proxy.respond(|seen| match seen.path.as_str() {
+        "/counter.js" => Reply {
+            status: 200,
+            headers: vec![
+                ("Content-Type".into(), "text/javascript".into()),
+                ("Cache-Control".into(), "public, max-age=3600".into()),
+            ],
+            body: b"window.counted = true;".to_vec(),
+        },
+        "/sw.js" => Reply {
+            status: 200,
+            headers: vec![("Content-Type".into(), "text/javascript".into())],
+            body: b"self.addEventListener('install', e => e.waitUntil(\
+                    caches.open('c').then(c => c.put('/x', new Response('x')))));\
+                    self.addEventListener('activate', e => e.waitUntil(clients.claim()));\
+                    self.addEventListener('fetch', () => {});"
+                .to_vec(),
+        },
+        "/sw" => Reply::html(
+            "<title>sw</title><script>localStorage.setItem('k', 'v');\
+             navigator.serviceWorker.register('/sw.js')\
+               .then(() => navigator.serviceWorker.ready)\
+               .then(() => caches.keys()).then(k => { document.title = 'sw ready ' + k.length; });\
+             </script>",
+        )
+        .header("Set-Cookie", "sid=1; Path=/"),
+        "/count" => Reply::html(
+            "<title>counting</title><script>\
+             Promise.all([navigator.serviceWorker.getRegistrations(), caches.keys()])\
+               .then(([r, k]) => { document.title = 'sw=' + r.length + ' caches=' + k.length \
+                 + ' ls=' + (localStorage.getItem('k') || '-'); });\
+             </script>",
+        ),
+        // Everything a site can keep, set from the page and the server.
+        "/set" => Reply::html(
+            "<title>setting</title><script>\
+             localStorage.setItem('k', 'v'); document.cookie = 'js=1; path=/';\
+             const open = indexedDB.open('db', 1);\
+             open.onupgradeneeded = () => open.result.createObjectStore('s');\
+             open.onsuccess = () => {\
+               const tx = open.result.transaction('s', 'readwrite');\
+               tx.objectStore('s').put('v', 'k');\
+               tx.oncomplete = () => { open.result.close(); navigator.serviceWorker.register('/sw.js')\
+                 .then(() => navigator.serviceWorker.ready).then(() => { document.title = 'set done'; }); };\
+             };\
+             </script>",
+        )
+        .header("Set-Cookie", "sid=1; Path=/"),
+        "/all" => Reply::html(
+            "<title>reading</title><script>\
+             Promise.all([navigator.serviceWorker.getRegistrations(), caches.keys(), indexedDB.databases()])\
+               .then(([r, k, d]) => { document.title = 'ck=' + document.cookie + ' ls=' + (localStorage.getItem('k') || '-')\
+                 + ' idb=' + d.length + ' sw=' + r.length + ' caches=' + k.length; });\
+             </script>",
+        ),
+        _ => Reply::html("<title>page</title><script src='/counter.js'></script>"),
+    });
+}
+
+fn counter_fetches(fake: &Fake) -> usize {
+    fake.proxy
+        .seen()
+        .iter()
+        .filter(|s| s.path == "/counter.js")
+        .count()
+}
+
+#[test]
+#[ignore]
+fn clearing_the_cache_forgets_cached_files_and_the_service_worker_but_not_the_session() {
+    let mut fake = Fake::start();
+    keeping_site(&fake);
+    fake.open(1, profile("a", None), 400, 300, 1.0);
+    fake.go(1, "http://localhost:3000/?n=1");
+    fake.go(1, "http://localhost:3000/?n=2");
+    assert_eq!(
+        counter_fetches(&fake),
+        1,
+        "the second load took the script from the cache"
+    );
+    // A second profile has a cache of its own.
+    fake.open(2, profile("b", None), 400, 300, 1.0);
+    fake.go(2, "http://localhost:3000/?n=3");
+    assert_eq!(counter_fetches(&fake), 2);
+    assert_eq!(fake.clear_cache(1, "http://localhost:3000"), None);
+    // What the page already holds in its own memory is not the engine's HTTP cache: a browser that
+    // starts afresh in the profile shows what that cache holds.
+    fake.open(3, profile("a", None), 400, 300, 1.0);
+    fake.go(3, "http://localhost:3000/?n=4");
+    assert_eq!(counter_fetches(&fake), 3, "the cleared profile asks again");
+    fake.open(4, profile("b", None), 400, 300, 1.0);
+    fake.go(4, "http://localhost:3000/?n=5");
+    assert_eq!(counter_fetches(&fake), 3, "the other profile's cache stays");
+
+    // The service worker and its Cache Storage go, the cookie stays.
+    fake.go(1, "http://localhost:3000/sw");
+    fake.title_is(1, "sw ready 1");
+    fake.go(1, "http://localhost:3000/count");
+    fake.title_is(1, "sw=1 caches=1 ls=v");
+    assert_eq!(fake.clear_cache(1, "http://localhost:3000"), None);
+    fake.go(1, "http://localhost:3000/count");
+    // Local Storage is not the cache's: it is there (set by the page before).
+    let state = fake.title_is(1, "sw=0 caches=0 ls=v");
+    assert!(state.error.is_none(), "{state:?}");
+    let cookie = fake
+        .proxy
+        .seen()
+        .iter()
+        .rev()
+        .find(|s| s.path == "/count")
+        .and_then(|s| s.cookie.clone());
+    assert_eq!(
+        cookie.as_deref(),
+        Some("sid=1"),
+        "the session is not the cache's"
+    );
+}
+
+const EVERYTHING: &str = "ck=sid=1; js=1 ls=v idb=1 sw=1 caches=1";
+const NOTHING: &str = "ck= ls=- idb=0 sw=0 caches=0";
+
+#[test]
+#[ignore]
+fn clearing_a_sites_data_takes_every_port_of_the_host_and_nothing_else() {
+    let mut fake = Fake::start();
+    keeping_site(&fake);
+    // The host `localhost` on two ports, another host, and another profile.
+    for (id, context, url) in [
+        (1, "a", "http://localhost:3000/set"),
+        (2, "a", "http://localhost:4000/set"),
+        (3, "a", "http://127.0.0.1:3000/set"),
+        (4, "b", "http://localhost:3000/set"),
+    ] {
+        fake.open(
+            id,
+            profile(context, Some(&format!("p{context}"))),
+            400,
+            300,
+            1.0,
+        );
+        fake.go(id, url);
+        fake.title_is(id, "set done");
+    }
+    // The page of one port is closed: its data is what nothing shows any more.
+    fake.send(Command::Close { browser: 2 });
+    fake.wait(Duration::from_secs(20), |e| {
+        matches!(e, Event::Closed { browser: 2 }).then_some(())
+    });
+    // The profile's watch has its base: what the clear deletes is told by the answer, not again
+    // as a change.
+    fake.profile_read(1);
+    fake.profile_watch(1, true);
+    std::thread::sleep(Duration::from_millis(1500));
+    let mark = fake.mark();
+    let (records, error) = fake.clear_site(1, "localhost");
+    assert_eq!(error, None);
+    assert_eq!(
+        fake.changed_since(mark, Duration::from_secs(4), |_| true),
+        None,
+        "what the clear deleted is not reported as a change"
+    );
+    let cookies: Vec<&Record> = records
+        .iter()
+        .filter(|r| matches!(r, Record::Cookie { .. }))
+        .collect();
+    assert_eq!(cookies.len(), 2, "{records:?}");
+    assert!(
+        records.contains(&Record::LocalStorage {
+            origin: "http://localhost:3000/".into(),
+            key: "k".into(),
+            value: None
+        }),
+        "{records:?}"
+    );
+    assert!(records.iter().all(|r| match r {
+        Record::Cookie { value, .. } => value.is_none(),
+        Record::LocalStorage { value, .. } => value.is_none(),
+        Record::IndexedDb { value, .. } => value.is_none(),
+    }));
+    assert!(
+        records.contains(&Record::IndexedDb {
+            origin: "http_localhost_4000".into(),
+            value: None
+        }),
+        "{records:?}"
+    );
+    // The open page, the closed one's port, then what must stay.
+    fake.go(1, "http://localhost:3000/all");
+    fake.title_is(1, NOTHING);
+    fake.open(5, profile("a", Some("pa")), 400, 300, 1.0);
+    fake.go(5, "http://localhost:4000/all");
+    fake.title_is(5, NOTHING);
+    fake.go(3, "http://127.0.0.1:3000/all");
+    fake.title_is(3, EVERYTHING);
+    fake.go(4, "http://localhost:3000/all");
+    fake.title_is(4, EVERYTHING);
+}
+
+#[test]
+#[ignore]
+fn a_port_nobody_has_open_is_cleared_after_a_restart_too() {
+    let root = scratch("profiles");
+    {
+        let mut fake = Fake::start_with(Options {
+            root: Some(root.clone()),
+            ..Default::default()
+        });
+        keeping_site(&fake);
+        fake.open(1, profile("a", Some("pa")), 400, 300, 1.0);
+        fake.go(1, "http://localhost:3000/set");
+        fake.title_is(1, "set done");
+        fake.go(1, "http://localhost:4000/set");
+        fake.title_is(1, "set done");
+        assert_eq!(fake.quit(), Some(0));
+    }
+    let mut fake = Fake::start_with(Options {
+        root: Some(root.clone()),
+        ..Default::default()
+    });
+    keeping_site(&fake);
+    fake.open(1, profile("a", Some("pa")), 400, 300, 1.0);
+    fake.go(1, "http://localhost:3000/all");
+    fake.title_is(1, EVERYTHING);
+    let (_, error) = fake.clear_site(1, "localhost");
+    assert_eq!(error, None);
+    fake.go(1, "http://localhost:4000/all");
+    fake.title_is(1, NOTHING);
+    fake.go(1, "http://localhost:3000/all");
+    fake.title_is(1, NOTHING);
+    drop(fake);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+#[ignore]
+fn emptying_what_is_not_there_is_answered_with_why() {
+    let mut fake = Fake::start();
+    assert_eq!(
+        fake.clear_cache(7, "http://localhost:3000").as_deref(),
+        Some("no such browser")
+    );
+    let (records, error) = fake.clear_site(7, "localhost");
+    assert!(records.is_empty());
+    assert_eq!(error.as_deref(), Some("no such browser"));
+    fake.open(1, profile("a", None), 200, 100, 1.0);
+    let (records, error) = fake.clear_site(1, "not a host/name");
+    assert!(records.is_empty());
+    assert_eq!(error.as_deref(), Some("not a host name"));
+}

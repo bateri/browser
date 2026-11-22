@@ -4,9 +4,9 @@
 //! It is also the check that the helper reaches the network only through it: the helper is
 //! started with no other way out.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -77,6 +77,8 @@ struct Shared {
     seen: Mutex<Vec<Seen>>,
     /// Requests refused for want of (right) credentials, by method.
     refused: Mutex<Vec<String>>,
+    /// Host names a `CONNECT` is carried through to a local port (a test's own TLS server).
+    tunnels: Mutex<HashMap<String, u16>>,
     stop: AtomicBool,
 }
 
@@ -94,6 +96,7 @@ impl StubProxy {
             responder: Mutex::new(Arc::new(|_| Reply::status(404))),
             seen: Mutex::new(Vec::new()),
             refused: Mutex::new(Vec::new()),
+            tunnels: Mutex::new(HashMap::new()),
             stop: AtomicBool::new(false),
         });
         let accept_shared = shared.clone();
@@ -117,6 +120,16 @@ impl StubProxy {
             .lock()
             .unwrap()
             .insert((user.into(), pass.into()));
+    }
+
+    /// Carries a `CONNECT` to `host` (on any port) through to `127.0.0.1:port`, so that a test's own
+    /// TLS server answers an `https` address; any other `CONNECT` is turned away.
+    pub fn tunnel(&self, host: &str, port: u16) {
+        self.shared
+            .tunnels
+            .lock()
+            .unwrap()
+            .insert(host.to_string(), port);
     }
 
     pub fn respond(&self, responder: impl Fn(&Seen) -> Reply + Send + Sync + 'static) {
@@ -213,7 +226,13 @@ fn serve(stream: TcpStream, shared: Arc<Shared>) {
             continue;
         };
         if method == "CONNECT" {
-            // The tests are plain http.
+            let host = target.rsplit_once(':').map_or(target.as_str(), |(h, _)| h);
+            let port = shared.tunnels.lock().unwrap().get(host).copied();
+            if let Some(port) = port {
+                tunnel(reader, out, port);
+                return;
+            }
+            // The other tests are plain http.
             let reply = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
             if out.write_all(reply).is_err() {
                 return;
@@ -273,4 +292,33 @@ fn serve(stream: TcpStream, shared: Arc<Shared>) {
             return;
         }
     }
+}
+
+/// Answers a `CONNECT` and carries the bytes both ways until either side closes.
+fn tunnel(mut from_client: BufReader<TcpStream>, mut to_client: TcpStream, port: u16) {
+    let Ok(upstream) = TcpStream::connect(("127.0.0.1", port)) else {
+        let _ = to_client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
+        return;
+    };
+    if to_client
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .is_err()
+    {
+        return;
+    }
+    let _ = to_client.set_read_timeout(None);
+    let Ok(mut up_write) = upstream.try_clone() else {
+        return;
+    };
+    let mut up_read = upstream;
+    let closer = to_client.try_clone();
+    let uploader = std::thread::spawn(move || {
+        let _ = std::io::copy(&mut from_client, &mut up_write);
+        let _ = up_write.shutdown(Shutdown::Write);
+    });
+    let _ = std::io::copy(&mut up_read, &mut to_client);
+    if let Ok(closer) = closer {
+        let _ = closer.shutdown(Shutdown::Both);
+    }
+    let _ = uploader.join();
 }

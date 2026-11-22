@@ -243,6 +243,9 @@ pub enum AgentOp {
     },
     /// A PNG of the page.
     Shot,
+    /// The page's last console lines (log, warning, error, uncaught error), at most 500, oldest
+    /// first, as `AgentOutput::Text`. Runs nothing in the page.
+    Console,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -423,6 +426,31 @@ pub enum Command {
     DevTools {
         browser: u32,
     },
+    /// Goes on to the page whose certificate the engine did not trust (`LoadError::certificate`):
+    /// that certificate is accepted for its host in this browser's profile for as long as the
+    /// helper runs (nothing is written to disk), and the page loads again. Nothing happens when
+    /// the browser's last failure was not a certificate's.
+    Proceed {
+        browser: u32,
+    },
+    /// Empties the engine's HTTP cache (the cache is shared by every site: the engine cannot
+    /// empty it by site), and the Cache Storage and service workers of `origin` (`https://a.test`,
+    /// every port is its own origin; empty for none). The page is not reloaded. Answered by
+    /// `Event::CacheCleared`.
+    ClearCache {
+        browser: u32,
+        req: u32,
+        origin: String,
+    },
+    /// Deletes what the profile keeps for `host` (a name, not an address): its cookies (those
+    /// of a parent domain that are sent to it too), and for every port and scheme of it the
+    /// Local Storage, IndexedDB, service workers and Cache Storage. Answered by
+    /// `Event::SiteCleared`, which says what was there.
+    ClearSiteData {
+        browser: u32,
+        req: u32,
+        host: String,
+    },
     Agent {
         browser: u32,
         req: u32,
@@ -540,6 +568,11 @@ pub struct LoadError {
     pub url: String,
     pub code: i32,
     pub message: String,
+    /// Why the engine did not trust the site's certificate (`self-signed`, `expired`, `wrong host
+    /// name`, `revoked`, `not trusted`), when that is what failed the load: `Proceed` goes on
+    /// anyway. `None` for every other failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -737,6 +770,24 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// The answer to `Command::ClearCache`; `error` says what was not emptied.
+    CacheCleared {
+        browser: u32,
+        req: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// The answer to `Command::ClearSiteData`: `records` are the ones the helper saw and deleted,
+    /// each as a tombstone (no `value`), in the grain they are kept in. Local Storage is listed
+    /// for the origins a page of the profile has open and the ones the helper holds as the base
+    /// of `ProfileWatch`; `error` says what was not deleted.
+    SiteCleared {
+        browser: u32,
+        req: u32,
+        records: Vec<Record>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// The answer to `Command::ProfileWrite`: every record is in the profile except `deferred`
     /// of them (Local Storage waiting for the first page of its origin).
     ProfileWritten {
@@ -810,6 +861,9 @@ impl Command {
             | Command::StopFinding { browser, .. }
             | Command::Zoom { browser, .. }
             | Command::DevTools { browser }
+            | Command::Proceed { browser }
+            | Command::ClearCache { browser, .. }
+            | Command::ClearSiteData { browser, .. }
             | Command::ProfileRead { browser, .. }
             | Command::ProfileWrite { browser, .. }
             | Command::ProfileWatch { browser, .. }
@@ -852,6 +906,9 @@ impl Command {
             Command::StopFinding { .. } => "stop_finding",
             Command::Zoom { .. } => "zoom",
             Command::DevTools { .. } => "dev_tools",
+            Command::Proceed { .. } => "proceed",
+            Command::ClearCache { .. } => "clear_cache",
+            Command::ClearSiteData { .. } => "clear_site_data",
             Command::Agent { .. } => "agent",
             Command::MenuResult { .. } => "menu_result",
             Command::DialogResult { .. } => "dialog_result",
@@ -890,6 +947,8 @@ impl Event {
             Event::Download { .. } => "download",
             Event::DownloadProgress { .. } => "download_progress",
             Event::AgentResult { .. } => "agent_result",
+            Event::CacheCleared { .. } => "cache_cleared",
+            Event::SiteCleared { .. } => "site_cleared",
             Event::CanScroll { .. } => "can_scroll",
             Event::ProfileRecords { .. } => "profile_records",
             Event::ProfileWritten { .. } => "profile_written",
@@ -923,6 +982,8 @@ impl Event {
             | Event::FileDialog { browser, .. }
             | Event::Download { browser, .. }
             | Event::AgentResult { browser, .. }
+            | Event::CacheCleared { browser, .. }
+            | Event::SiteCleared { browser, .. }
             | Event::ProfileRecords { browser, .. }
             | Event::ProfileWritten { browser, .. }
             | Event::ProfileChanged { browser, .. }

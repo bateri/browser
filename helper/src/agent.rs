@@ -99,6 +99,13 @@ pub fn start(id: u32, req: u32, op: AgentOp) {
             Kind::Shot,
             vec![("Page.captureScreenshot", json!({"format": "png"}))],
         ),
+        AgentOp::Console => {
+            let lines = with_entry(id, |e| e.console.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let (text, truncated) = cap_text(&lines.join("\n"), MAX_TEXT);
+            finish(id, req, AgentOutput::Text { text, truncated });
+            return;
+        }
         AgentOp::Click { target } => click_plan(target),
         AgentOp::Type {
             text,
@@ -358,7 +365,7 @@ pub fn fail_all(id: u32, why: &str) {
 /// job (it is not answered).
 pub fn refuse(id: u32, command: &Command, why: &str) -> bool {
     let Command::Agent { req, .. } = command else {
-        return crate::sync::refuse(id, command, why);
+        return crate::clear::refuse(id, command, why) || crate::sync::refuse(id, command, why);
     };
     finish(id, *req, failed(why));
     true
@@ -477,7 +484,9 @@ wrap_dev_tools_message_observer! {
             params: Option<&[u8]>,
         ) {
             if let Some(method) = method {
-                crate::sync::on_event(self.id, &method.to_string(), params.unwrap_or(&[]));
+                let (method, params) = (method.to_string(), params.unwrap_or(&[]));
+                crate::console::on_event(self.id, &method, params);
+                crate::sync::on_event(self.id, &method, params);
             }
         }
     }

@@ -186,6 +186,17 @@ fn commands() -> Vec<Command> {
             ratio: 1.25,
         },
         Command::DevTools { browser: 1 },
+        Command::Proceed { browser: 1 },
+        Command::ClearCache {
+            browser: 1,
+            req: 30,
+            origin: "http://localhost:3000".into(),
+        },
+        Command::ClearSiteData {
+            browser: 1,
+            req: 31,
+            host: "localhost".into(),
+        },
         Command::Agent {
             browser: 1,
             req: 9,
@@ -265,6 +276,7 @@ fn events() -> Vec<Event> {
                 url: "http://x.test/".into(),
                 code: -105,
                 message: "net::ERR_NAME_NOT_RESOLVED".into(),
+                certificate: None,
             }),
             found: Some(Found {
                 count: 4,
@@ -368,6 +380,34 @@ fn events() -> Vec<Event> {
                 text: "hello".into(),
                 truncated: false,
             },
+        },
+        Event::CacheCleared {
+            browser: 1,
+            req: 30,
+            error: None,
+        },
+        Event::SiteCleared {
+            browser: 1,
+            req: 31,
+            records: vec![
+                Record::Cookie {
+                    domain: "localhost".into(),
+                    path: "/".into(),
+                    name: "sid".into(),
+                    partition: None,
+                    value: None,
+                },
+                Record::LocalStorage {
+                    origin: "http://localhost:3000/".into(),
+                    key: "token".into(),
+                    value: None,
+                },
+                Record::IndexedDb {
+                    origin: "http_localhost_3000".into(),
+                    value: None,
+                },
+            ],
+            error: None,
         },
         Event::CanScroll {
             browser: 1,
@@ -501,8 +541,28 @@ fn every_event_has_its_fixture() {
         editable: false,
     };
     check("to-bateri", "menu_shortcut", &with_shortcut);
+    // A load that failed on a certificate says why.
+    let with_certificate = Event::State {
+        browser: 1,
+        url: "https://localhost:8443/".into(),
+        title: "Privacy error".into(),
+        loading: false,
+        can_back: false,
+        can_forward: false,
+        status: String::new(),
+        zoom: 1.0,
+        error: Some(LoadError {
+            url: "https://localhost:8443/".into(),
+            code: -202,
+            message: "ERR_CERT_AUTHORITY_INVALID".into(),
+            certificate: Some("self-signed".into()),
+        }),
+        found: None,
+    };
+    check("to-bateri", "state_certificate", &with_certificate);
     let mut want: Vec<String> = all.iter().map(|e| e.name().to_string()).collect();
     want.push("menu_shortcut".into());
+    want.push("state_certificate".into());
     want.sort();
     assert_eq!(
         files("to-bateri"),
@@ -531,6 +591,7 @@ fn agent_operations_and_outputs_are_fixtures_too() {
             },
         ),
         ("shot", AgentOp::Shot),
+        ("console", AgentOp::Console),
     ];
     for (name, op) in &ops {
         check("agent-ops", name, op);
@@ -727,6 +788,15 @@ fn a_key_from_before_editing_commands_still_reads() {
     assert!(!plain.contains("commands"), "{plain}");
     let key: Command = serde_json::from_str(&plain).unwrap();
     assert!(matches!(key, Command::Key { commands, .. } if commands.is_empty()));
+}
+
+#[test]
+fn a_load_error_of_a_helper_that_knew_no_certificates_still_reads() {
+    let old = r#"{"url":"http://x.test/","code":-105,"message":"net::ERR_NAME_NOT_RESOLVED"}"#;
+    let error: LoadError = serde_json::from_str(old).unwrap();
+    assert_eq!(error.certificate, None);
+    // And a failure that is no certificate's does not write the field.
+    assert_eq!(serde_json::to_string(&error).unwrap(), old);
 }
 
 #[test]

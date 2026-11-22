@@ -3,6 +3,7 @@
 //! expects. The code that talks to the helper is `browser_ipc`'s own, the code bateri will run.
 
 pub mod proxy;
+pub mod tls_site;
 
 use browser_ipc::message::*;
 use browser_ipc::{Frame, Launch, Receiver, Surface, Writer};
@@ -409,6 +410,41 @@ impl Fake {
 
     pub fn popup_frames(&self, id: u32) -> u32 {
         self.frames.count(id, KIND_POPUP)
+    }
+
+    /// Empties the HTTP cache and `origin`'s service workers and Cache Storage; waits for the answer
+    /// (its error).
+    pub fn clear_cache(&mut self, id: u32, origin: &str) -> Option<String> {
+        let req = self.req();
+        self.send(Command::ClearCache {
+            browser: id,
+            req,
+            origin: origin.into(),
+        });
+        self.wait(DEFAULT_WAIT, |e| match e {
+            Event::CacheCleared { req: r, error, .. } if *r == req => Some(error.clone()),
+            _ => None,
+        })
+    }
+
+    /// Deletes what the profile keeps for `host`; waits for the answer (what was there, and its
+    /// error).
+    pub fn clear_site(&mut self, id: u32, host: &str) -> (Vec<Record>, Option<String>) {
+        let req = self.req();
+        self.send(Command::ClearSiteData {
+            browser: id,
+            req,
+            host: host.into(),
+        });
+        self.wait(DEFAULT_WAIT, |e| match e {
+            Event::SiteCleared {
+                req: r,
+                records,
+                error,
+                ..
+            } if *r == req => Some((records.clone(), error.clone())),
+            _ => None,
+        })
     }
 
     /// Reads what the browser's profile holds (cookies, Local Storage of the open pages).
