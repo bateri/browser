@@ -425,7 +425,6 @@ pub fn created(id: u32, browser: Browser) {
     .unwrap_or_default();
     emit(Event::Opened { browser: id });
     push_state(id);
-    crate::console::enable(id);
     sync::browser_ready(id);
     for command in queued {
         apply(id, &browser, command);

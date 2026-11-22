@@ -25,6 +25,9 @@ enum Kind {
     Shot,
     /// The call in flight asks where a node is; its answer becomes a click.
     Quads,
+    /// The call turns the console's protocol on; its answer is the console, with the note of a first
+    /// reading. (The events of what was logged come before the answer.)
+    Console,
     /// Calls whose answers only matter by succeeding.
     Plain,
 }
@@ -100,12 +103,15 @@ pub fn start(id: u32, req: u32, op: AgentOp) {
             vec![("Page.captureScreenshot", json!({"format": "png"}))],
         ),
         AgentOp::Console => {
-            let lines = with_entry(id, |e| e.console.iter().cloned().collect::<Vec<_>>())
-                .unwrap_or_default();
-            // What is too long loses its old lines: the error that was just thrown is the one asked for.
-            let (text, truncated) = last_lines(&lines, MAX_TEXT);
-            finish(id, req, AgentOutput::Text { text, truncated });
-            return;
+            // The first request turns the protocol on for this browser and answers when it has;
+            // the others read what was kept since.
+            let on = with_entry(id, |e| std::mem::replace(&mut e.console_on, true)).unwrap_or(true);
+            if !on {
+                (Kind::Console, vec![("Runtime.enable", json!({}))])
+            } else {
+                finish(id, req, console_text(id, false));
+                return;
+            }
         }
         AgentOp::Click { target } => click_plan(target),
         AgentOp::Type {
@@ -309,10 +315,15 @@ pub fn on_result(id: u32, message_id: i32, success: bool, bytes: &[u8]) {
         let why = json["message"]
             .as_str()
             .unwrap_or("the protocol call failed");
+        if matches!(job.kind, Kind::Console) {
+            // It was not turned on: the next request tries again.
+            with_entry(id, |e| e.console_on = false);
+        }
         finish(id, job.req, failed(why));
         return;
     }
     match job.kind {
+        Kind::Console => finish(id, job.req, console_text(id, true)),
         Kind::Text => {
             if let Some(why) = json["exceptionDetails"]["text"].as_str() {
                 finish(id, job.req, failed(why));
@@ -377,6 +388,19 @@ pub fn refuse_all(id: u32, queue: &[Command], why: &str) {
     for command in queue {
         refuse(id, command, why);
     }
+}
+
+/// The console of browser `id` as the text an agent reads: the last lines that fit, and for the
+/// first reading the note that says what may be missing.
+fn console_text(id: u32, first: bool) -> AgentOutput {
+    let mut lines =
+        with_entry(id, |e| e.console.iter().cloned().collect::<Vec<_>>()).unwrap_or_default();
+    if first {
+        lines.insert(0, crate::console::FIRST_NOTE.to_owned());
+    }
+    // What is too long loses its old lines: the error that was just thrown is the one asked for.
+    let (text, truncated) = last_lines(&lines, MAX_TEXT);
+    AgentOutput::Text { text, truncated }
 }
 
 /// The last of `lines`, joined, that fit in `max` bytes (a line longer than that is cut at its end);

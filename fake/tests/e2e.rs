@@ -3812,10 +3812,25 @@ fn the_consoles_last_lines_are_read_without_running_anything_in_the_page() {
     fake.open(1, profile("a", None), 400, 300, 1.0);
     fake.go(1, "http://page.test/");
     std::thread::sleep(Duration::from_millis(500));
+    // The protocol is turned on by the first request for the console, not before: that one says that
+    // what the page logged until then may be missing, and the page is loaded again to log it.
+    let AgentOutput::Text { text, .. } = fake.agent(1, AgentOp::Console) else {
+        panic!("the console is text");
+    };
+    assert!(
+        text.starts_with("[note] the console is read from this request on"),
+        "{text}"
+    );
+    fake.go(1, "http://page.test/");
+    std::thread::sleep(Duration::from_millis(500));
     let AgentOutput::Text { text, truncated } = fake.agent(1, AgentOp::Console) else {
         panic!("the console is text");
     };
     assert!(!truncated);
+    assert!(
+        !text.contains("[note]"),
+        "only the first reading has it: {text}"
+    );
     let lines: Vec<&str> = text.lines().collect();
     // An object is shown by what it holds, not as `[object Object]`.
     assert!(

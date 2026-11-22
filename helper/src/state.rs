@@ -219,6 +219,10 @@ pub struct Entry {
     pub rejected: HashMap<String, Rejected>,
     /// The last lines of the page's console, oldest first (`CONSOLE_LINES`).
     pub console: std::collections::VecDeque<String>,
+    /// The protocol's `Runtime` is on for this browser, because an agent asked for the console:
+    /// from then on it stays on. Before that no browser has it, since a page can tell, and the
+    /// engine keeps what the console was given.
+    pub console_on: bool,
     pub found: Option<Found>,
     /// A new search was started and has not selected its first match yet.
     pub find_activate: Option<FindStart>,

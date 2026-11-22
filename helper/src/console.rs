@@ -2,9 +2,14 @@
 //! `Runtime` events, not from the engine's console callback: that one hands over only the text
 //! the page's arguments print as (`console.log({a: 1})` arrives as `[object Object]`), where the
 //! protocol carries a preview of each argument, and an uncaught error with its description.
+//!
+//! `Runtime` is turned on for a browser by the first request for its console, not when it comes
+//! up: a page can tell that it is on (and may then ask the person to prove who they are), and the
+//! engine keeps every object a page logs for as long as it is. What the page logged before it was
+//! turned on is replayed by the engine when it is, though an object in it shows as `Object` and no
+//! more (measured), and some of it may not be there; the first answer says so ([`FIRST_NOTE`]).
 
 use crate::state::{CONSOLE_LINES, with_entry};
-use crate::sync::{self, Call};
 use serde_json::{Value, json};
 
 /// The most lines of an error's description that are kept (the rest is its stack).
@@ -12,10 +17,8 @@ const ERROR_LINES: usize = 6;
 /// The most properties of an object a line shows.
 const PROPERTIES: usize = 8;
 
-/// A browser is up: the protocol is asked to tell of its console.
-pub fn enable(id: u32) {
-    sync::send_call(id, "Runtime.enable", json!({}), Call::Quiet);
-}
+/// What the answer to the first request for a browser's console begins with.
+pub const FIRST_NOTE: &str = "[note] the console is read from this request on; what the page logged before it may be missing or less detailed: reload the page to see its log from the start";
 
 /// An event of the protocol: a console line is kept when it is one.
 pub fn on_event(id: u32, method: &str, params: &[u8]) {
