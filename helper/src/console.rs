@@ -22,6 +22,11 @@ pub fn on_event(id: u32, method: &str, params: &[u8]) {
     if !method.starts_with("Runtime.") {
         return;
     }
+    // A page that is left takes its console with it, as the tools of the engine's own do.
+    if method == "Runtime.executionContextsCleared" {
+        with_entry(id, |e| e.console.clear());
+        return;
+    }
     let json: Value = serde_json::from_slice(params).unwrap_or(Value::Null);
     let line = match method {
         "Runtime.consoleAPICalled" => line_of_call(&json),

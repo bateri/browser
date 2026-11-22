@@ -53,6 +53,10 @@ enum Phase {
 
 struct Op {
     browser: u32,
+    /// The request the application gave it (`Command::ClearCache`'s `req`): only the answer says it.
+    /// Every pane of the application numbers its own requests from the same start, and the helper
+    /// is one for all of them, so an operation is kept and its protocol calls are told by `key`.
+    req: u32,
     kind: Kind,
     phase: Phase,
     left: usize,
@@ -64,6 +68,15 @@ struct Op {
 
 thread_local! {
     static OPS: std::cell::RefCell<HashMap<u32, Op>> = std::cell::RefCell::new(HashMap::new());
+    static KEYS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A number no other operation of this run has.
+fn next_key() -> u32 {
+    KEYS.with(|k| {
+        k.set(k.get().wrapping_add(1));
+        k.get()
+    })
 }
 
 fn ops<T>(f: impl FnOnce(&mut HashMap<u32, Op>) -> T) -> T {
@@ -175,6 +188,27 @@ fn read_origins(path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The origins of `host` are no longer ones the profile keeps anything of: the run and the profile's
+/// file forget them, so a site whose data was cleared leaves no trace of having been visited there.
+/// A page of the host still open is noted again when it loads.
+fn forget_origins(id: u32, host: &str, dir: Option<&str>) {
+    let ours = |o: &String| host_of_origin(o).is_some_and(|h| h.eq_ignore_ascii_case(host));
+    with(|s| {
+        let context = s.entries.get(&id).map(|e| e.context.clone());
+        if let Some(c) = context.and_then(|c| s.contexts.get_mut(&c)) {
+            c.origins.retain(|o| !ours(o));
+        }
+    });
+    let Some(dir) = dir else { return };
+    let path = with(|s| origins_path(&s.root, dir));
+    let lines = read_origins(&path);
+    let kept: Vec<&String> = lines.iter().filter(|o| !ours(o)).collect();
+    if kept.len() != lines.len() {
+        let text: String = kept.iter().map(|o| format!("{o}\n")).collect();
+        let _ = std::fs::write(&path, text);
+    }
+}
+
 /// The origins of `host` the helper can name for the profile of browser `id`.
 fn origins_of_host(id: u32, host: &str, dir: Option<&str>) -> BTreeSet<String> {
     let (visited, open, root) = with(|s| {
@@ -225,8 +259,8 @@ fn open_at(id: u32, owner: &str) -> Option<u32> {
     })
 }
 
-fn send(browser: u32, req: u32, method: &'static str, params: Value, what: Clear) -> bool {
-    sync::send_call(browser, method, params, Call::Clear { req, what })
+fn send(browser: u32, key: u32, method: &'static str, params: Value, what: Clear) -> bool {
+    sync::send_call(browser, method, params, Call::Clear { key, what })
 }
 
 /// `Command::ClearCache`.
@@ -239,14 +273,19 @@ pub fn cache(id: u32, req: u32, origin: String) {
         });
         return;
     };
+    let key = next_key();
+    // The engine's cache is one call, and a site's caches of the page's origin another: counted
+    // before either is made, so that the answer of the first does not end the operation.
+    let origin_call = !origin.is_empty() && records::owner_of_url(&format!("{origin}/")).is_some();
     ops(|o| {
         o.insert(
-            req,
+            key,
             Op {
                 browser: id,
+                req,
                 kind: Kind::Cache,
                 phase: Phase::Delete,
-                left: 1,
+                left: 1 + usize::from(origin_call),
                 cookies: Vec::new(),
                 items: Vec::new(),
                 origins: Vec::new(),
@@ -257,34 +296,33 @@ pub fn cache(id: u32, req: u32, origin: String) {
     // The engine's cache is the profile's: every site's.
     match host.request_context() {
         Some(context) => {
-            let mut done = CacheDone::new(req);
+            let mut done = CacheDone::new(key);
             context.clear_http_cache(Some(&mut done));
         }
-        None => finish_one(req, Some("the profile has no request context".into())),
+        None => finish_one(key, Some("the profile has no request context".into())),
     }
-    if !origin.is_empty() && records::owner_of_url(&format!("{origin}/")).is_some() {
-        ops(|o| o.get_mut(&req).map(|op| op.left += 1));
-        if !send(
+    if origin_call
+        && !send(
             id,
-            req,
+            key,
             "Storage.clearDataForOrigin",
             json!({"origin": origin, "storageTypes": CACHE_TYPES}),
             Clear::Delete,
-        ) {
-            finish_one(req, Some("the protocol call was not sent".into()));
-        }
+        )
+    {
+        finish_one(key, Some("the protocol call was not sent".into()));
     }
 }
 
 wrap_completion_callback! {
     struct CacheDone {
-        req: u32,
+        key: u32,
     }
 
     impl CompletionCallback {
         fn on_complete(&self) {
-            trace!("clear {}: the HTTP cache is empty", self.req);
-            finish_one(self.req, None);
+            trace!("clear {}: the HTTP cache is empty", self.key);
+            finish_one(self.key, None);
         }
     }
 }
@@ -310,11 +348,13 @@ pub fn site(id: u32, req: u32, host: String) {
         .into_iter()
         .collect();
     trace!("clear {req}: site {host}: origins {origins:?}");
+    let key = next_key();
     ops(|o| {
         o.insert(
-            req,
+            key,
             Op {
                 browser: id,
+                req,
                 kind: Kind::Site { host, dir },
                 phase: Phase::Read,
                 left: 0,
@@ -326,7 +366,7 @@ pub fn site(id: u32, req: u32, host: String) {
         )
     });
     let mut left = 0;
-    if send(id, req, "Network.getAllCookies", json!({}), Clear::Cookies) {
+    if send(id, key, "Network.getAllCookies", json!({}), Clear::Cookies) {
         left += 1;
     }
     // The Local Storage the engine will tell of is the one of a page that is open.
@@ -340,7 +380,7 @@ pub fn site(id: u32, req: u32, host: String) {
         };
         if send(
             b,
-            req,
+            key,
             "DOMStorage.getDOMStorageItems",
             json!({"storageId": records::storage_id(&owner)}),
             call,
@@ -348,14 +388,14 @@ pub fn site(id: u32, req: u32, host: String) {
             left += 1;
         }
     }
-    ops(|o| o.get_mut(&req).map(|op| op.left = left));
+    ops(|o| o.get_mut(&key).map(|op| op.left = left));
     if left == 0 {
-        read_done(req);
+        read_done(key);
     }
 }
 
 /// The answer to a protocol call of an operation.
-pub fn on_result(browser: u32, req: u32, what: Clear, success: bool, json: &Value) {
+pub fn on_result(browser: u32, key: u32, what: Clear, success: bool, json: &Value) {
     let why = || {
         json["message"]
             .as_str()
@@ -366,30 +406,30 @@ pub fn on_result(browser: u32, req: u32, what: Clear, success: bool, json: &Valu
         Clear::Cookies => {
             if success {
                 let all = records::cookies_of(json);
-                ops(|o| o.get_mut(&req).map(|op| op.cookies = all));
+                ops(|o| o.get_mut(&key).map(|op| op.cookies = all));
             }
-            finish_one(req, (!success).then(why));
+            finish_one(key, (!success).then(why));
         }
         Clear::Items { origin } => {
             if success {
                 let items: Items = records::items_of(json).into_iter().collect();
-                ops(|o| o.get_mut(&req).map(|op| op.items.push((origin, items))));
+                ops(|o| o.get_mut(&key).map(|op| op.items.push((origin, items))));
             }
-            finish_one(req, (!success).then(why));
+            finish_one(key, (!success).then(why));
         }
-        Clear::Delete => finish_one(req, (!success).then(why)),
+        Clear::Delete => finish_one(key, (!success).then(why)),
     }
     let _ = browser;
 }
 
 /// A call of an operation will not be answered (its browser went away).
-pub fn call_lost(req: u32, why: &str) {
-    finish_one(req, Some(why.into()));
+pub fn call_lost(key: u32, why: &str) {
+    finish_one(key, Some(why.into()));
 }
 
-fn finish_one(req: u32, error: Option<String>) {
+fn finish_one(key: u32, error: Option<String>) {
     let reached = ops(|o| {
-        let op = o.get_mut(&req)?;
+        let op = o.get_mut(&key)?;
         op.left = op.left.saturating_sub(1);
         if op.error.is_none() {
             op.error = error;
@@ -397,16 +437,16 @@ fn finish_one(req: u32, error: Option<String>) {
         (op.left == 0).then_some(matches!(op.phase, Phase::Read))
     });
     match reached {
-        Some(true) => read_done(req),
-        Some(false) => answer(req),
+        Some(true) => read_done(key),
+        Some(false) => answer(key),
         None => {}
     }
 }
 
 /// Everything there is to know is known: what goes is listed, and deleted.
-fn read_done(req: u32) {
+fn read_done(key: u32) {
     let Some((browser, host, dir, cookies, items, origins)) = ops(|o| {
-        let op = o.get_mut(&req)?;
+        let op = o.get_mut(&key)?;
         op.phase = Phase::Delete;
         let Kind::Site { host, dir } = &op.kind else {
             return None;
@@ -493,37 +533,38 @@ fn read_done(req: u32) {
     if let Some(dir) = &dir {
         sync::forget(dir, &ids, &known_items, &folders);
     }
+    forget_origins(browser, &host, dir.as_deref());
     ops(|o| {
-        if let Some(op) = o.get_mut(&req) {
+        if let Some(op) = o.get_mut(&key) {
             op.cookies = gone;
         }
     });
     let mut left = 0;
     for (b, method, params) in calls {
-        if send(b, req, method, params, Clear::Delete) {
+        if send(b, key, method, params, Clear::Delete) {
             left += 1;
         }
     }
-    ops(|o| o.get_mut(&req).map(|op| op.left = left));
+    ops(|o| o.get_mut(&key).map(|op| op.left = left));
     if left == 0 {
-        answer(req);
+        answer(key);
     }
 }
 
-fn answer(req: u32) {
-    let Some(op) = ops(|o| o.remove(&req)) else {
+fn answer(key: u32) {
+    let Some(op) = ops(|o| o.remove(&key)) else {
         return;
     };
-    trace!("clear {req}: answered, error {:?}", op.error);
+    trace!("clear {}: answered, error {:?}", op.req, op.error);
     match op.kind {
         Kind::Cache => emit(Event::CacheCleared {
             browser: op.browser,
-            req,
+            req: op.req,
             error: op.error,
         }),
         Kind::Site { .. } => emit(Event::SiteCleared {
             browser: op.browser,
-            req,
+            req: op.req,
             records: op.cookies,
             error: op.error,
         }),
@@ -562,7 +603,9 @@ pub fn proceed(id: u32) {
         error.certificate.as_ref()?;
         let host = host_of_origin(&error.url)?.to_ascii_lowercase();
         let der = e.rejected.get(&host)?.der.clone();
-        Some((error.url.clone(), host, der, e.context.clone()))
+        // A certificate the engine would not show is none to go on with: nothing is accepted by an empty
+        // one, which would be every certificate of the host.
+        (!der.is_empty()).then(|| (error.url.clone(), host, der, e.context.clone()))
     })
     .flatten();
     let Some((url, host, der, context)) = target else {

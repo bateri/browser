@@ -3801,6 +3801,7 @@ fn the_consoles_last_lines_are_read_without_running_anything_in_the_page() {
         "/many" => Reply::html(
             "<title>many</title><script>for (let i = 0; i < 600; i++) console.log('line ' + i);</script>",
         ),
+        "/quiet" => Reply::html("<title>quiet</title><script>console.log('quiet');</script>"),
         _ => Reply::html(
             "<title>console</title><script>\
              console.log({a: 1, b: [2, 3]}); console.debug('detail'); console.warn('careful');\
@@ -3845,6 +3846,14 @@ fn the_consoles_last_lines_are_read_without_running_anything_in_the_page() {
     assert_eq!(lines.len(), 500, "{}", lines.len());
     assert!(lines[0].starts_with("[log] line 100 ("), "{}", lines[0]);
     assert!(lines[499].starts_with("[log] line 599 ("), "{}", lines[499]);
+    // A page that is left takes its console with it: what is read is of the page that is shown.
+    fake.go(1, "http://page.test/quiet");
+    std::thread::sleep(Duration::from_millis(500));
+    let AgentOutput::Text { text, .. } = fake.agent(1, AgentOp::Console) else {
+        panic!("the console is text");
+    };
+    assert!(text.starts_with("[log] quiet ("), "{text}");
+    assert_eq!(text.lines().count(), 1, "{text}");
 }
 
 /// A server for the tests of what a site keeps: a script the engine may cache for an hour, a page

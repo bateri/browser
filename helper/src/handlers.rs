@@ -595,10 +595,8 @@ wrap_request_handler! {
                 Some(s.contexts.get(&context)?.accepted.contains(&(host.clone(), der.clone())))
             })
             .unwrap_or(false);
-            if accepted {
-                if let Some(callback) = callback {
-                    callback.cont();
-                }
+            if accepted && let Some(callback) = callback {
+                callback.cont();
                 return 1;
             }
             with_entry(self.id, |e| e.rejected.insert(host, state::Rejected { der, self_signed }));

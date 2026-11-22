@@ -102,7 +102,8 @@ pub fn start(id: u32, req: u32, op: AgentOp) {
         AgentOp::Console => {
             let lines = with_entry(id, |e| e.console.iter().cloned().collect::<Vec<_>>())
                 .unwrap_or_default();
-            let (text, truncated) = cap_text(&lines.join("\n"), MAX_TEXT);
+            // What is too long loses its old lines: the error that was just thrown is the one asked for.
+            let (text, truncated) = last_lines(&lines, MAX_TEXT);
             finish(id, req, AgentOutput::Text { text, truncated });
             return;
         }
@@ -378,6 +379,25 @@ pub fn refuse_all(id: u32, queue: &[Command], why: &str) {
     }
 }
 
+/// The last of `lines`, joined, that fit in `max` bytes (a line longer than that is cut at its end);
+/// whether anything was left out.
+pub fn last_lines(lines: &[String], max: usize) -> (String, bool) {
+    let mut size = 0;
+    let mut from = lines.len();
+    while from > 0 && size + lines[from - 1].len() < max {
+        from -= 1;
+        size += lines[from].len() + 1;
+    }
+    if from == lines.len() {
+        // Not one line fits whole: its beginning stands for it.
+        return match lines.last() {
+            Some(line) => (cap_text(line, max).0, true),
+            None => (String::new(), false),
+        };
+    }
+    (lines[from..].join("\n"), from > 0)
+}
+
 /// `text` cut to at most `max` bytes at a character boundary.
 pub fn cap_text(text: &str, max: usize) -> (String, bool) {
     if text.len() <= max {
@@ -502,6 +522,24 @@ mod tests {
         assert_eq!(cap_text("abcdef", 3), ("abc".to_string(), true));
         // 'ç' is two bytes: a cut inside it backs up.
         assert_eq!(cap_text("açb", 2), ("a".to_string(), true));
+    }
+
+    #[test]
+    fn a_console_too_long_keeps_its_newest_lines() {
+        let lines: Vec<String> = ["old", "newer", "newest"]
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(
+            last_lines(&lines, 100),
+            ("old\nnewer\nnewest".to_string(), false)
+        );
+        // Each line counts a byte for its break: "newer" and "newest" are 6 and 7.
+        assert_eq!(last_lines(&lines, 13), ("newer\nnewest".to_string(), true));
+        assert_eq!(last_lines(&lines, 7), ("newest".to_string(), true));
+        // A line that does not fit whole stands for itself by its beginning.
+        assert_eq!(last_lines(&lines, 4), ("newe".to_string(), true));
+        assert_eq!(last_lines(&[], 4), (String::new(), false));
     }
 
     #[test]

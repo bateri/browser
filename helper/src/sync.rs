@@ -56,7 +56,7 @@ pub enum Call {
     /// count when it was asked for: an answer to an older one names a script that is taken away.
     AddScript { req: Option<u32>, generation: u64 },
     /// A call of the operations that empty a profile (`clear`).
-    Clear { req: u32, what: crate::clear::Clear },
+    Clear { key: u32, what: crate::clear::Clear },
 }
 
 enum Op {
@@ -297,7 +297,7 @@ pub fn browser_gone(id: u32) {
             | Call::AddScript { req: Some(req), .. } => {
                 call_done(req, Some("the browser was closed".into()));
             }
-            Call::Clear { req, .. } => crate::clear::call_lost(req, "the browser was closed"),
+            Call::Clear { key, .. } => crate::clear::call_lost(key, "the browser was closed"),
             _ => {}
         }
     }
@@ -718,7 +718,7 @@ pub fn on_result(id: u32, message_id: i32, success: bool, bytes: &[u8]) -> bool 
     trace!("sync {id}#{message_id} -> ok={success}");
     match call {
         Call::Quiet => {}
-        Call::Clear { req, what } => crate::clear::on_result(id, req, what, success, &json),
+        Call::Clear { key, what } => crate::clear::on_result(id, key, what, success, &json),
         Call::PollCookies => {
             let Some(dir) = dir_of(id) else { return true };
             let changes = sync(|s| {
