@@ -242,8 +242,13 @@ fn create_context(profile: &Profile) -> bool {
             path.to_string_lossy().into_owned()
         }
     };
+    // A profile that has a name is kept on disk, and what it keeps is what its home keeps for it
+    // (`sync`): the cookies of the session stay too, or a restart would take from the profile what
+    // the home still holds and nothing would give it back. The engine ignores the setting where
+    // there is no folder.
     let settings = RequestContextSettings {
         cache_path: cache_path.as_str().into(),
+        persist_session_cookies: i32::from(profile.dir.is_some()),
         ..Default::default()
     };
     let mut handler = ContextHandler::new(profile.context.clone());

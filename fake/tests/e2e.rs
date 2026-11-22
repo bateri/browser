@@ -3473,6 +3473,49 @@ fn a_profile_read_in_one_is_written_in_another_and_its_first_page_is_signed_in()
 
 #[test]
 #[ignore]
+fn a_named_profile_keeps_its_session_cookies_when_the_helper_ends_and_starts_again() {
+    let root = scratch("session-cookies");
+    {
+        let mut fake = Fake::start_with(Options {
+            root: Some(root.clone()),
+            ..Default::default()
+        });
+        fake.proxy.respond(profile_site);
+        fake.open(1, profile("a", Some("pa")), 200, 100, 1.0);
+        fake.go(1, "http://site.test/set");
+        fake.go(1, "http://site.test/");
+        let records = fake.profile_read(1);
+        // `tmp` has no end (a cookie of the session) and `sid` has one.
+        assert_eq!(
+            cookie_named(&records, "tmp").map(|c| c.expires),
+            Some(None),
+            "{records:?}"
+        );
+        assert!(cookie_named(&records, "sid").is_some(), "{records:?}");
+        assert_eq!(fake.quit(), Some(0));
+    }
+    // What a profile keeps for its person is what the home keeps for it: a computer that
+    // restarts (or whose helper ended after its linger) must not lose the cookies of the session
+    // that were roamed to it, or its home and its profile say different things.
+    let mut fake = Fake::start_with(Options {
+        root: Some(root.clone()),
+        ..Default::default()
+    });
+    fake.proxy.respond(profile_site);
+    fake.open(1, profile("a", Some("pa")), 200, 100, 1.0);
+    let records = fake.profile_read(1);
+    assert!(cookie_named(&records, "sid").is_some(), "{records:?}");
+    assert_eq!(
+        cookie_named(&records, "tmp").map(|c| c.value.as_str()),
+        Some("2"),
+        "the session cookie is gone after a restart: {records:?}"
+    );
+    assert_eq!(fake.quit(), Some(0));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+#[ignore]
 fn changes_come_as_records_and_what_was_written_does_not_come_back() {
     let mut fake = Fake::start();
     fake.proxy.respond(profile_site);
