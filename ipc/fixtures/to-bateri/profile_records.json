@@ -1,0 +1,33 @@
+{
+  "e": "profile_records",
+  "browser": 1,
+  "req": 21,
+  "records": [
+    {
+      "kind": "cookie",
+      "domain": ".example.com",
+      "path": "/",
+      "name": "sid",
+      "partition": {
+        "site": "https://example.com",
+        "cross_site": false
+      },
+      "value": {
+        "value": "s3cret",
+        "expires": 1900000000.0,
+        "secure": true,
+        "http_only": true,
+        "same_site": 2,
+        "priority": 1,
+        "source_scheme": 2,
+        "source_port": 443
+      }
+    },
+    {
+      "kind": "local_storage",
+      "origin": "https://example.com/",
+      "key": "token",
+      "value": "abc"
+    }
+  ]
+}

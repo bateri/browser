@@ -1,0 +1,5 @@
+{
+  "kind": "local_storage",
+  "origin": "https://example.com/",
+  "key": "token"
+}

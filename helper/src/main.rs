@@ -12,10 +12,12 @@ mod handlers;
 mod keys;
 mod mac;
 mod pinch;
+mod records;
 mod rules;
 mod scroll;
 mod state;
 mod switches;
+mod sync;
 
 pub use state::request_quit;
 
@@ -149,6 +151,7 @@ fn main() {
 
     let root = prepare_root(&cfg.root).unwrap_or_else(|e| fail(&e, 1));
     with(|s| s.root = root.clone());
+    sync::clear_stages(&root);
 
     let args = Args::new();
     let mut app = HelperApp::new(cfg.proxy_port, cfg.mock_keychain);
@@ -294,6 +297,9 @@ fn run(rx: &mpsc::Receiver<Msg>) {
             next = next.min(at);
         }
         if let Some(at) = commands::next_repaint() {
+            next = next.min(at);
+        }
+        if let Some(at) = sync::next_due() {
             next = next.min(at);
         }
         let first = rx.recv_timeout(next.saturating_duration_since(now));

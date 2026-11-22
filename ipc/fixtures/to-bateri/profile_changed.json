@@ -1,0 +1,31 @@
+{
+  "e": "profile_changed",
+  "browser": 1,
+  "records": [
+    {
+      "kind": "local_storage",
+      "origin": "https://example.com/",
+      "key": "token",
+      "value": "abc"
+    },
+    {
+      "kind": "indexed_db",
+      "origin": "https_example.com_0",
+      "value": {
+        "format": "chromium-idb-leveldb",
+        "major": 156,
+        "files": [
+          {
+            "path": "leveldb/000003.log",
+            "size": 4096
+          },
+          {
+            "path": "blob/1/00/1",
+            "size": 12
+          }
+        ]
+      }
+    }
+  ],
+  "stage": ".stage/30"
+}

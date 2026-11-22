@@ -41,6 +41,100 @@ pub struct Profile {
     pub pass: String,
 }
 
+/// What a profile's data is made of, at the grain it is kept and sent in: one cookie, one item of
+/// one origin's Local Storage, or one origin's whole IndexedDB folder. A record with no `value`
+/// says the thing is gone (a tombstone). Neither side reads into a value more than it needs: the
+/// profile's home keeps records and tells them apart by their key (`kind` plus the key's fields).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Record {
+    Cookie {
+        /// As the engine writes it: a cookie of a domain (not only of a host) starts with a dot.
+        domain: String,
+        path: String,
+        name: String,
+        /// The site a partitioned cookie is kept under; `None` is a cookie of no partition.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        partition: Option<Partition>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<CookieValue>,
+    },
+    /// An item of Local Storage. `origin` is the engine's own name for the storage's owner
+    /// (`https://example.com/`), only ever handed back to it.
+    LocalStorage {
+        origin: String,
+        key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+    },
+    /// The folder of an origin's IndexedDB, whole: the files are in the stage the message names.
+    IndexedDb {
+        /// The folder's own name for the origin (`https_example.com_0`).
+        origin: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<IndexedDbValue>,
+    },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Partition {
+    /// The top-level site the cookie is kept under (`https://example.com`).
+    pub site: String,
+    /// The cookie was set in a frame that has a cross-site ancestor.
+    #[serde(default)]
+    pub cross_site: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct CookieValue {
+    pub value: String,
+    /// Seconds since the epoch; `None` is a cookie of the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<f64>,
+    #[serde(default)]
+    pub secure: bool,
+    #[serde(default)]
+    pub http_only: bool,
+    /// 0 unspecified, 1 none, 2 lax, 3 strict.
+    #[serde(default)]
+    pub same_site: u8,
+    /// 0 low, 1 medium, 2 high.
+    #[serde(default = "medium")]
+    pub priority: u8,
+    /// 0 unset, 1 non-secure, 2 secure.
+    #[serde(default)]
+    pub source_scheme: u8,
+    /// The port the cookie was set from; -1 is none known.
+    #[serde(default = "no_port")]
+    pub source_port: i32,
+}
+
+fn medium() -> u8 {
+    1
+}
+
+fn no_port() -> i32 {
+    -1
+}
+
+/// What an origin's IndexedDB folder is, as the engine that wrote it names it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct IndexedDbValue {
+    /// The storage format (`chromium-idb-leveldb`): an engine that does not read it keeps its own.
+    pub format: String,
+    /// The engine's major version.
+    pub major: u16,
+    /// The files, by their path below the origin's folder in the stage (`leveldb/000003.log`,
+    /// `blob/1/00/1`): the names are the engine's, the bytes are the stage's.
+    pub files: Vec<IndexedDbFile>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct IndexedDbFile {
+    pub path: String,
+    pub size: u64,
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MouseKind {
@@ -359,6 +453,49 @@ pub enum Command {
     DownloadCancel {
         req: u32,
     },
+    /// Reads what the browser's profile holds in the engine: its cookies and the Local Storage of
+    /// the origins that have a page open. Answered by `Event::ProfileRecords`. What it reads is
+    /// the base `ProfileWatch` reports changes from.
+    ProfileRead {
+        browser: u32,
+        req: u32,
+    },
+    /// Puts records into the browser's profile (what comes from elsewhere): cookies at once, Local
+    /// Storage at once where a page of the origin is open and before the first page of it
+    /// otherwise. Answered by `Event::ProfileWritten`, after which a navigation sees all of it.
+    /// What is written is not reported back by `ProfileWatch`. `IndexedDb` records are not taken
+    /// here (`IndexedDbWrite`).
+    ProfileWrite {
+        browser: u32,
+        req: u32,
+        records: Vec<Record>,
+    },
+    /// Starts (or stops) `Event::ProfileChanged` for the browser's profile.
+    ProfileWatch {
+        browser: u32,
+        on: bool,
+    },
+    /// Copies each origin's IndexedDB folder of the profile in folder `dir` into a stage of the
+    /// helper's own and answers with a record for each (`Event::IndexedDbRecords`). Needs no
+    /// browser: the folder is read as it lies.
+    IndexedDbRead {
+        req: u32,
+        dir: String,
+    },
+    /// Replaces origins' IndexedDB folders with the files of `stage` (bateri made it below the
+    /// helper's stage folder). Only a profile whose engine is not running takes it: the engine
+    /// keeps an opened store and does not see a folder put under it, so a running profile's
+    /// records are handed back as deferred. Answered by `Event::IndexedDbWritten`.
+    IndexedDbWrite {
+        req: u32,
+        dir: String,
+        stage: String,
+        records: Vec<Record>,
+    },
+    /// The helper may delete a stage it named in an event or bateri made for `IndexedDbWrite`.
+    StageDrop {
+        stage: String,
+    },
     /// Shuts the helper down in order (profiles are flushed).
     Quit,
 }
@@ -592,6 +729,52 @@ pub enum Event {
         req: u32,
         can: bool,
     },
+    /// The answer to `Command::ProfileRead`; `error` says why `records` is not the whole of it.
+    ProfileRecords {
+        browser: u32,
+        req: u32,
+        records: Vec<Record>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// The answer to `Command::ProfileWrite`: every record is in the profile except `deferred`
+    /// of them (Local Storage waiting for the first page of its origin).
+    ProfileWritten {
+        browser: u32,
+        req: u32,
+        #[serde(default)]
+        deferred: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// What the profile gained, changed or lost since the base and since the last of these, once
+    /// `Command::ProfileWatch` is on. An `IndexedDb` record's files are in `stage`, which bateri
+    /// frees with `Command::StageDrop`.
+    ProfileChanged {
+        browser: u32,
+        records: Vec<Record>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stage: Option<String>,
+    },
+    /// The answer to `Command::IndexedDbRead`: the files of the records are in `stage`, which
+    /// bateri frees with `Command::StageDrop`.
+    IndexedDbRecords {
+        req: u32,
+        records: Vec<Record>,
+        stage: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// The answer to `Command::IndexedDbWrite`: `written` records are in the folder, `deferred`
+    /// are not (the engine of the profile is running, or the records are in a format this
+    /// engine does not read).
+    IndexedDbWritten {
+        req: u32,
+        written: u32,
+        deferred: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// Something the helper could not do; `browser` is set when one browser's.
     Error {
         browser: Option<u32>,
@@ -627,12 +810,18 @@ impl Command {
             | Command::StopFinding { browser, .. }
             | Command::Zoom { browser, .. }
             | Command::DevTools { browser }
+            | Command::ProfileRead { browser, .. }
+            | Command::ProfileWrite { browser, .. }
+            | Command::ProfileWatch { browser, .. }
             | Command::Agent { browser, .. } => Some(*browser),
             Command::MenuResult { .. }
             | Command::DialogResult { .. }
             | Command::FileResult { .. }
             | Command::DownloadResult { .. }
             | Command::DownloadCancel { .. }
+            | Command::IndexedDbRead { .. }
+            | Command::IndexedDbWrite { .. }
+            | Command::StageDrop { .. }
             | Command::Quit => None,
         }
     }
@@ -669,6 +858,12 @@ impl Command {
             Command::FileResult { .. } => "file_result",
             Command::DownloadResult { .. } => "download_result",
             Command::DownloadCancel { .. } => "download_cancel",
+            Command::ProfileRead { .. } => "profile_read",
+            Command::ProfileWrite { .. } => "profile_write",
+            Command::ProfileWatch { .. } => "profile_watch",
+            Command::IndexedDbRead { .. } => "indexed_db_read",
+            Command::IndexedDbWrite { .. } => "indexed_db_write",
+            Command::StageDrop { .. } => "stage_drop",
             Command::Quit => "quit",
         }
     }
@@ -696,6 +891,11 @@ impl Event {
             Event::DownloadProgress { .. } => "download_progress",
             Event::AgentResult { .. } => "agent_result",
             Event::CanScroll { .. } => "can_scroll",
+            Event::ProfileRecords { .. } => "profile_records",
+            Event::ProfileWritten { .. } => "profile_written",
+            Event::ProfileChanged { .. } => "profile_changed",
+            Event::IndexedDbRecords { .. } => "indexed_db_records",
+            Event::IndexedDbWritten { .. } => "indexed_db_written",
             Event::Error { .. } => "error",
         }
     }
@@ -703,7 +903,10 @@ impl Event {
     /// The browser this event is about, when it is about one.
     pub fn browser(&self) -> Option<u32> {
         match self {
-            Event::Hello { .. } | Event::DownloadProgress { .. } => None,
+            Event::Hello { .. }
+            | Event::DownloadProgress { .. }
+            | Event::IndexedDbRecords { .. }
+            | Event::IndexedDbWritten { .. } => None,
             Event::Error { browser, .. } => *browser,
             Event::Opened { browser }
             | Event::Closed { browser }
@@ -720,6 +923,9 @@ impl Event {
             | Event::FileDialog { browser, .. }
             | Event::Download { browser, .. }
             | Event::AgentResult { browser, .. }
+            | Event::ProfileRecords { browser, .. }
+            | Event::ProfileWritten { browser, .. }
+            | Event::ProfileChanged { browser, .. }
             | Event::CanScroll { browser, .. } => Some(*browser),
         }
     }

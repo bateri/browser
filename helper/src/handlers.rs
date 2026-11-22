@@ -264,6 +264,9 @@ wrap_load_handler! {
                 e.can_forward = can_go_forward != 0;
             });
             push_state(self.id);
+            if is_loading == 0 {
+                crate::sync::page_loaded(self.id);
+            }
         }
 
         fn on_load_error(

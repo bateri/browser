@@ -212,6 +212,13 @@ pub struct Entry {
     /// fails the key is sent again the engine's own way (see `agent::fire`).
     pub fired: HashMap<i32, Fired>,
     pub next_cdp: i32,
+    /// The calls of `sync` in flight, by call number.
+    pub syncs: HashMap<i32, crate::sync::Call>,
+    /// The protocol's storage and network events were asked for (`sync`).
+    pub sync_ready: bool,
+    /// The script the protocol runs before every new document, which puts waiting Local Storage
+    /// items in (`sync`): its name, to take it away.
+    pub seed_script: Option<String>,
     /// The questions of `Command::CanScroll` the page has not answered, by call number: the `req`
     /// each answer is owed to.
     pub scroll_asks: HashMap<i32, u32>,

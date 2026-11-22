@@ -3364,3 +3364,299 @@ fn a_frame_of_another_origin_keeps_the_swipe_and_a_pinched_view_pans_first() {
     assert!(!can_scroll(&mut fake, 50, 50, ABOUT_BACK));
     assert!(can_scroll(&mut fake, 50, 50, ABOUT_FORWARD));
 }
+
+// ---- a profile's data as records ----
+
+const SITE: &str = "http://site.test/";
+
+/// The pages of the profile tests: one sets cookies, one writes Local Storage, one shows what a
+/// page finds in its Local Storage as its title.
+fn profile_site(seen: &Seen) -> Reply {
+    match seen.path.as_str() {
+        "/set" => Reply::html("<title>set</title>")
+            .header(
+                "Set-Cookie",
+                "sid=1; Max-Age=3600; Path=/; HttpOnly; SameSite=Lax",
+            )
+            .header("Set-Cookie", "tmp=2; Path=/"),
+        "/write" => Reply::html(
+            "<title>w</title><script>localStorage.setItem('token','abc');document.title='written'</script>",
+        ),
+        "/read" => Reply::html(
+            "<title>r</title><script>document.title='token='+localStorage.getItem('token')</script>",
+        ),
+        "/idb-write" => Reply::html(
+            "<title>i</title><script>var r=indexedDB.open('d',1);\
+r.onupgradeneeded=function(){r.result.createObjectStore('s')};\
+r.onsuccess=function(){var t=r.result.transaction('s','readwrite');t.objectStore('s').put('hello','k');\
+t.oncomplete=function(){document.title='idb-written'}}</script>",
+        ),
+        "/idb-read" => Reply::html(
+            "<title>i</title><script>var r=indexedDB.open('d',1);\
+r.onupgradeneeded=function(){r.result.createObjectStore('s')};\
+r.onsuccess=function(){var g=r.result.transaction('s').objectStore('s').get('k');\
+g.onsuccess=function(){document.title='idb='+g.result}}</script>",
+        ),
+        _ => Reply::html("<title>page</title>"),
+    }
+}
+
+fn cookie_named<'a>(records: &'a [Record], name: &str) -> Option<&'a CookieValue> {
+    records.iter().find_map(|r| match r {
+        Record::Cookie {
+            name: n,
+            value: Some(v),
+            ..
+        } if n == name => Some(v),
+        _ => None,
+    })
+}
+
+fn item_of<'a>(records: &'a [Record], key: &str) -> Option<&'a str> {
+    records.iter().find_map(|r| match r {
+        Record::LocalStorage {
+            key: k,
+            value: Some(v),
+            ..
+        } if k == key => Some(v.as_str()),
+        _ => None,
+    })
+}
+
+#[test]
+#[ignore]
+fn a_profile_read_in_one_is_written_in_another_and_its_first_page_is_signed_in() {
+    let mut fake = Fake::start();
+    fake.proxy.respond(profile_site);
+    // Two profiles in one helper.
+    fake.open(1, profile("a", Some("pa")), 200, 100, 1.0);
+    fake.open(2, profile("b", Some("pb")), 200, 100, 1.0);
+    fake.go(1, "http://site.test/set");
+    fake.go(1, "http://site.test/write");
+    fake.title_is(1, "written");
+
+    let records = fake.profile_read(1);
+    let sid = cookie_named(&records, "sid").unwrap_or_else(|| panic!("no sid: {records:?}"));
+    assert_eq!(sid.value, "1");
+    assert!(sid.http_only, "{sid:?}");
+    assert_eq!(sid.same_site, 2, "{sid:?}");
+    assert!(sid.expires.is_some(), "{sid:?}");
+    // A cookie of the session has no end.
+    assert_eq!(cookie_named(&records, "tmp").map(|c| c.expires), Some(None));
+    assert_eq!(item_of(&records, "token"), Some("abc"), "{records:?}");
+    // What the other profile holds is its own: nothing of the first one's.
+    let other = fake.profile_read(2);
+    assert!(cookie_named(&other, "sid").is_none(), "{other:?}");
+    assert!(item_of(&other, "token").is_none(), "{other:?}");
+
+    // Into the second, before it has gone anywhere: the cookie is written at once, the item
+    // waits for the first page of its origin.
+    let deferred = fake.profile_write(2, records.clone());
+    assert_eq!(deferred, 1);
+    fake.forget();
+    fake.go(2, "http://site.test/read");
+    // The first request this profile ever sent carried the cookie (and its httpOnly cookie).
+    let first = fake
+        .proxy
+        .seen()
+        .into_iter()
+        .find(|s| s.user == "user-b" && s.host.contains("site.test"))
+        .expect("a request of the second profile");
+    assert!(
+        first.cookie.as_deref().is_some_and(|c| c.contains("sid=1")),
+        "{first:?}"
+    );
+    // The page's own script found the item: the seed ran before it.
+    fake.title_is(2, "token=abc");
+    assert_eq!(fake.quit(), Some(0));
+}
+
+#[test]
+#[ignore]
+fn changes_come_as_records_and_what_was_written_does_not_come_back() {
+    let mut fake = Fake::start();
+    fake.proxy.respond(profile_site);
+    fake.open(1, profile("a", Some("pa")), 200, 100, 1.0);
+    fake.go(1, "http://site.test/");
+    let base = fake.profile_read(1);
+    assert!(cookie_named(&base, "sid").is_none(), "{base:?}");
+    fake.profile_watch(1, true);
+
+    // A response that sets cookies is seen at once, not at the next look.
+    let mark = fake.mark();
+    fake.go(1, "http://site.test/set");
+    let (changes, _) = fake
+        .changed_since(
+            mark,
+            Duration::from_secs(10),
+            |r| matches!(r, Record::Cookie { name, .. } if name == "sid"),
+        )
+        .unwrap_or_else(|| panic!("the cookie was not reported: {}", fake.recent(8)));
+    assert!(cookie_named(&changes, "tmp").is_some(), "{changes:?}");
+
+    // A page writing Local Storage is reported by its events.
+    let mark = fake.mark();
+    fake.go(1, "http://site.test/write");
+    fake.changed_since(mark, Duration::from_secs(10), |r| {
+        matches!(r, Record::LocalStorage { key, value: Some(v), .. } if key == "token" && v == "abc")
+    })
+    .unwrap_or_else(|| panic!("the item was not reported: {}", fake.recent(8)));
+
+    // What the other end wrote is not a change: neither the cookie nor the item (the page of its
+    // origin is open) comes back.
+    let cookie = Record::Cookie {
+        domain: "site.test".into(),
+        path: "/".into(),
+        name: "remote".into(),
+        partition: None,
+        value: Some(CookieValue {
+            value: "r1".into(),
+            expires: None,
+            secure: false,
+            http_only: true,
+            same_site: 0,
+            priority: 1,
+            source_scheme: 1,
+            source_port: 80,
+        }),
+    };
+    let item = Record::LocalStorage {
+        origin: SITE.into(),
+        key: "remote-item".into(),
+        value: Some("x".into()),
+    };
+    let mark = fake.mark();
+    let deferred = fake.profile_write(1, vec![cookie, item]);
+    assert_eq!(deferred, 0);
+    let echoed = fake.changed_since(mark, Duration::from_secs(3), |r| match r {
+        Record::Cookie { name, .. } => name == "remote",
+        Record::LocalStorage { key, .. } => key == "remote-item",
+        _ => false,
+    });
+    assert!(echoed.is_none(), "{echoed:?}");
+    // The write did land: a fresh read has both.
+    let now = fake.profile_read(1);
+    assert!(cookie_named(&now, "remote").is_some(), "{now:?}");
+    assert_eq!(item_of(&now, "remote-item"), Some("x"), "{now:?}");
+
+    // A deletion is a record too.
+    fake.profile_write(
+        1,
+        vec![Record::Cookie {
+            domain: "site.test".into(),
+            path: "/".into(),
+            name: "remote".into(),
+            partition: None,
+            value: None,
+        }],
+    );
+    assert!(cookie_named(&fake.profile_read(1), "remote").is_none());
+    assert_eq!(fake.quit(), Some(0));
+}
+
+#[test]
+#[ignore]
+fn an_indexed_db_goes_by_folder_into_a_profile_that_is_not_running() {
+    let mut fake = Fake::start();
+    fake.proxy.respond(profile_site);
+    fake.open(1, profile("a", Some("pa")), 200, 100, 1.0);
+    fake.go(1, "http://site.test/idb-write");
+    fake.title_is(1, "idb-written");
+    std::thread::sleep(Duration::from_secs(1));
+
+    let (records, stage) = fake.indexed_db_read("pa");
+    let Some(Record::IndexedDb {
+        origin,
+        value: Some(value),
+    }) = records.first()
+    else {
+        panic!("no folder: {records:?}");
+    };
+    assert_eq!(origin, "http_site.test_0");
+    assert_eq!(value.format, "chromium-idb-leveldb");
+    assert!(
+        value.files.iter().any(|f| f.path.starts_with("leveldb/")),
+        "{value:?}"
+    );
+    assert!(
+        fake.root
+            .join(&stage)
+            .join(origin)
+            .join(&value.files[0].path)
+            .exists()
+    );
+
+    // A profile whose engine runs does not take it; one that has not been opened does.
+    let (written, deferred) = fake.indexed_db_write("pa", &stage, records.clone());
+    assert_eq!((written, deferred), (0, 1));
+    let (written, deferred) = fake.indexed_db_write("pb", &stage, records.clone());
+    assert_eq!((written, deferred), (1, 0));
+    // A name that leads out of the folder is refused whole.
+    let mut bad = records.clone();
+    if let Some(Record::IndexedDb {
+        value: Some(value), ..
+    }) = bad.first_mut()
+    {
+        value.files[0].path = "leveldb/../../x".into();
+    }
+    fake.send(Command::IndexedDbWrite {
+        req: 900,
+        dir: "pc".into(),
+        stage: stage.clone(),
+        records: bad,
+    });
+    let error = fake.wait(Duration::from_secs(20), |e| match e {
+        Event::IndexedDbWritten {
+            req: 900, error, ..
+        } => Some(error.clone()),
+        _ => None,
+    });
+    assert!(error.is_some());
+    assert!(!fake.root.join("pc/IndexedDB").join("x").exists());
+
+    fake.open(2, profile("b", Some("pb")), 200, 100, 1.0);
+    fake.go(2, "http://site.test/idb-read");
+    fake.title_is(2, "idb=hello");
+    fake.send(Command::StageDrop {
+        stage: stage.clone(),
+    });
+    wait_until("the stage to go", || !fake.root.join(&stage).exists());
+    assert_eq!(fake.quit(), Some(0));
+}
+
+#[test]
+#[ignore]
+fn a_watched_profile_reports_its_indexed_db_once_it_lies_still() {
+    let mut fake = Fake::start();
+    fake.proxy.respond(profile_site);
+    fake.open(1, profile("a", Some("pa")), 200, 100, 1.0);
+    fake.go(1, "http://site.test/");
+    fake.profile_watch(1, true);
+    std::thread::sleep(Duration::from_secs(2));
+    let mark = fake.mark();
+    fake.go(1, "http://site.test/idb-write");
+    fake.title_is(1, "idb-written");
+    let (changes, stage) = fake
+        .changed_since(mark, Duration::from_secs(15), |r| {
+            matches!(r, Record::IndexedDb { value: Some(_), .. })
+        })
+        .unwrap_or_else(|| panic!("the folder was not reported: {}", fake.recent(8)));
+    let stage = stage.expect("a stage");
+    let Some(Record::IndexedDb {
+        origin,
+        value: Some(value),
+    }) = changes
+        .iter()
+        .find(|r| matches!(r, Record::IndexedDb { .. }))
+    else {
+        panic!("no folder")
+    };
+    assert!(
+        fake.root
+            .join(&stage)
+            .join(origin)
+            .join(&value.files[0].path)
+            .exists()
+    );
+    assert_eq!(fake.quit(), Some(0));
+}

@@ -36,7 +36,7 @@ fn string_items(items: &[Value]) -> Vec<&str> {
 }
 
 /// A flat JSON object as the engine's dictionary type.
-fn to_dict(params: &Value) -> DictionaryValue {
+pub(crate) fn to_dict(params: &Value) -> DictionaryValue {
     let dict = dictionary_value_create().expect("dictionary");
     if let Value::Object(map) = params {
         for (key, value) in map {
@@ -57,6 +57,15 @@ fn to_dict(params: &Value) -> DictionaryValue {
                 Value::Object(_) => {
                     let mut inner = to_dict(value);
                     dict.set_dictionary(Some(&key), Some(&mut inner));
+                }
+                // Lists of objects (the cookies of `Network.setCookies`).
+                Value::Array(items) if items.iter().any(Value::is_object) => {
+                    let mut list = list_value_create().expect("list");
+                    for (at, item) in items.iter().filter(|i| i.is_object()).enumerate() {
+                        let mut inner = to_dict(item);
+                        list.set_dictionary(at, Some(&mut inner));
+                    }
+                    dict.set_list(Some(&key), Some(&mut list));
                 }
                 // Lists of strings (the editing commands of a key).
                 Value::Array(items) => {
@@ -267,6 +276,7 @@ fn failed(message: &str) -> AgentOutput {
 pub fn on_result(id: u32, message_id: i32, success: bool, bytes: &[u8]) {
     if crate::pinch::on_result(id, message_id, success, bytes)
         || crate::scroll::on_result(id, message_id, success, bytes)
+        || crate::sync::on_result(id, message_id, success, bytes)
     {
         return;
     }
@@ -348,7 +358,7 @@ pub fn fail_all(id: u32, why: &str) {
 /// job (it is not answered).
 pub fn refuse(id: u32, command: &Command, why: &str) -> bool {
     let Command::Agent { req, .. } = command else {
-        return false;
+        return crate::sync::refuse(id, command, why);
     };
     finish(id, *req, failed(why));
     true
@@ -458,6 +468,17 @@ wrap_dev_tools_message_observer! {
             result: Option<&[u8]>,
         ) {
             on_result(self.id, message_id, success != 0, result.unwrap_or(&[]));
+        }
+
+        fn on_dev_tools_event(
+            &self,
+            _browser: Option<&mut Browser>,
+            method: Option<&CefString>,
+            params: Option<&[u8]>,
+        ) {
+            if let Some(method) = method {
+                crate::sync::on_event(self.id, &method.to_string(), params.unwrap_or(&[]));
+            }
         }
     }
 }

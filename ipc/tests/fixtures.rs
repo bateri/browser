@@ -33,6 +33,56 @@ fn key() -> KeyData {
     }
 }
 
+fn cookie() -> Record {
+    Record::Cookie {
+        domain: ".example.com".into(),
+        path: "/".into(),
+        name: "sid".into(),
+        partition: Some(Partition {
+            site: "https://example.com".into(),
+            cross_site: false,
+        }),
+        value: Some(CookieValue {
+            value: "s3cret".into(),
+            expires: Some(1_900_000_000.0),
+            secure: true,
+            http_only: true,
+            same_site: 2,
+            priority: 1,
+            source_scheme: 2,
+            source_port: 443,
+        }),
+    }
+}
+
+fn storage_item() -> Record {
+    Record::LocalStorage {
+        origin: "https://example.com/".into(),
+        key: "token".into(),
+        value: Some("abc".into()),
+    }
+}
+
+fn indexed_db() -> Record {
+    Record::IndexedDb {
+        origin: "https_example.com_0".into(),
+        value: Some(IndexedDbValue {
+            format: "chromium-idb-leveldb".into(),
+            major: 156,
+            files: vec![
+                IndexedDbFile {
+                    path: "leveldb/000003.log".into(),
+                    size: 4096,
+                },
+                IndexedDbFile {
+                    path: "blob/1/00/1".into(),
+                    size: 12,
+                },
+            ],
+        }),
+    }
+}
+
 fn commands() -> Vec<Command> {
     vec![
         Command::Open {
@@ -161,6 +211,32 @@ fn commands() -> Vec<Command> {
             path: Some("/tmp/report.csv".into()),
         },
         Command::DownloadCancel { req: 6 },
+        Command::ProfileRead {
+            browser: 1,
+            req: 21,
+        },
+        Command::ProfileWrite {
+            browser: 1,
+            req: 22,
+            records: vec![cookie(), storage_item()],
+        },
+        Command::ProfileWatch {
+            browser: 1,
+            on: true,
+        },
+        Command::IndexedDbRead {
+            req: 23,
+            dir: "0123abcd".into(),
+        },
+        Command::IndexedDbWrite {
+            req: 24,
+            dir: "0123abcd".into(),
+            stage: ".stage/24".into(),
+            records: vec![indexed_db()],
+        },
+        Command::StageDrop {
+            stage: ".stage/24".into(),
+        },
         Command::Quit,
     ]
 }
@@ -297,6 +373,35 @@ fn events() -> Vec<Event> {
             browser: 1,
             req: 5,
             can: false,
+        },
+        Event::ProfileRecords {
+            browser: 1,
+            req: 21,
+            records: vec![cookie(), storage_item()],
+            error: None,
+        },
+        Event::ProfileWritten {
+            browser: 1,
+            req: 22,
+            deferred: 1,
+            error: None,
+        },
+        Event::ProfileChanged {
+            browser: 1,
+            records: vec![storage_item(), indexed_db()],
+            stage: Some(".stage/30".into()),
+        },
+        Event::IndexedDbRecords {
+            req: 23,
+            records: vec![indexed_db()],
+            stage: ".stage/23".into(),
+            error: None,
+        },
+        Event::IndexedDbWritten {
+            req: 24,
+            written: 1,
+            deferred: 0,
+            error: None,
         },
         Event::Error {
             browser: Some(1),
@@ -455,6 +560,88 @@ fn agent_operations_and_outputs_are_fixtures_too() {
     for (name, output) in &outputs {
         check("agent-outputs", name, output);
     }
+}
+
+#[test]
+fn records_are_fixtures_too() {
+    // A tombstone is a record without its value; a cookie of no partition has no `partition`.
+    let records = [
+        ("cookie", cookie()),
+        (
+            "cookie_plain",
+            Record::Cookie {
+                domain: "localhost".into(),
+                path: "/".into(),
+                name: "session".into(),
+                partition: None,
+                value: Some(CookieValue {
+                    value: "1".into(),
+                    expires: None,
+                    secure: false,
+                    http_only: false,
+                    same_site: 0,
+                    priority: 1,
+                    source_scheme: 1,
+                    source_port: 3000,
+                }),
+            },
+        ),
+        (
+            "cookie_gone",
+            Record::Cookie {
+                domain: "localhost".into(),
+                path: "/".into(),
+                name: "session".into(),
+                partition: None,
+                value: None,
+            },
+        ),
+        ("local_storage", storage_item()),
+        (
+            "local_storage_gone",
+            Record::LocalStorage {
+                origin: "https://example.com/".into(),
+                key: "token".into(),
+                value: None,
+            },
+        ),
+        ("indexed_db", indexed_db()),
+        (
+            "indexed_db_gone",
+            Record::IndexedDb {
+                origin: "https_example.com_0".into(),
+                value: None,
+            },
+        ),
+    ];
+    for (name, record) in &records {
+        check("records", name, record);
+    }
+    let mut want: Vec<String> = records.iter().map(|(n, _)| n.to_string()).collect();
+    want.sort();
+    assert_eq!(
+        files("records"),
+        want,
+        "a fixture without a record, or the reverse"
+    );
+}
+
+#[test]
+fn a_cookie_value_without_its_newer_fields_reads_with_their_defaults() {
+    let value: CookieValue = serde_json::from_str(r#"{"value":"v"}"#).unwrap();
+    assert_eq!(
+        value,
+        CookieValue {
+            value: "v".into(),
+            expires: None,
+            secure: false,
+            http_only: false,
+            same_site: 0,
+            priority: 1,
+            source_scheme: 0,
+            source_port: -1,
+        }
+    );
 }
 
 #[test]

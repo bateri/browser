@@ -1,0 +1,15 @@
+{
+  "kind": "cookie",
+  "domain": "localhost",
+  "path": "/",
+  "name": "session",
+  "value": {
+    "value": "1",
+    "secure": false,
+    "http_only": false,
+    "same_site": 0,
+    "priority": 1,
+    "source_scheme": 1,
+    "source_port": 3000
+  }
+}

@@ -10,7 +10,7 @@ use crate::state::{
     self, Context, Creds, Entry, FindStart, Fired, OpenMenu, State, browser_of, emit, emit_error,
     take_where, with, with_entry,
 };
-use crate::{agent, keys, rules, switches, trace};
+use crate::{agent, keys, rules, switches, sync, trace};
 use browser_ipc::Command;
 use browser_ipc::message::{Button, DownloadState, EditAction, Event, KeyKind, MouseKind, Profile};
 use cef::*;
@@ -90,6 +90,14 @@ pub fn handle(command: Command) {
         }
         Command::DownloadResult { req, path } => download_result(req, path),
         Command::DownloadCancel { req } => download_cancel(req),
+        Command::IndexedDbRead { req, dir } => sync::idb_read(req, dir),
+        Command::IndexedDbWrite {
+            req,
+            dir,
+            stage,
+            records,
+        } => sync::idb_write(req, dir, stage, records),
+        Command::StageDrop { stage } => sync::stage_drop(&stage),
         other => {
             // Everything left names a browser.
             let Some(id) = other.browser() else { return };
@@ -410,6 +418,7 @@ pub fn created(id: u32, browser: Browser) {
     .unwrap_or_default();
     emit(Event::Opened { browser: id });
     push_state(id);
+    sync::browser_ready(id);
     for command in queued {
         apply(id, &browser, command);
     }
@@ -437,6 +446,7 @@ fn drop_entry(id: u32, why: &str) -> Option<Entry> {
 
 /// The browser is gone (`on_before_close`).
 pub fn closed(id: u32) {
+    sync::browser_gone(id);
     agent::fail_all(id, "the browser was closed");
     dismiss_all(id);
     cancel_downloads(id);
@@ -787,6 +797,9 @@ fn apply(id: u32, browser: &Browser, command: Command) {
             }
         }
         Command::Agent { req, op, .. } => agent::start(id, req, op),
+        Command::ProfileRead { req, .. } => sync::read(id, req),
+        Command::ProfileWrite { req, records, .. } => sync::write(id, req, records),
+        Command::ProfileWatch { on, .. } => sync::watch(id, on),
         other => trace!("not for a browser: {}", other.name()),
     }
 }
@@ -887,6 +900,7 @@ pub fn next_repaint() -> Option<Instant> {
 
 /// Asks for the frames that were dropped while bateri was behind.
 pub fn tick() {
+    sync::tick();
     let now = Instant::now();
     let waiting = with(|s| front_waiters(s, now));
     // The window exists only after the engine has made it, a turn or two after the command.
@@ -979,6 +993,7 @@ pub fn none_open() -> bool {
 pub fn release_all() {
     let ids: Vec<u32> = with(|s| s.entries.keys().copied().collect());
     for id in ids {
+        sync::browser_gone(id);
         agent::fail_all(id, "the helper is quitting");
         dismiss_all(id);
         cancel_downloads(id);

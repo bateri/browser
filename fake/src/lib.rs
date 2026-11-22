@@ -411,6 +411,125 @@ impl Fake {
         self.frames.count(id, KIND_POPUP)
     }
 
+    /// Reads what the browser's profile holds (cookies, Local Storage of the open pages).
+    pub fn profile_read(&mut self, id: u32) -> Vec<Record> {
+        let req = self.req();
+        self.send(Command::ProfileRead { browser: id, req });
+        let (records, error) = self.wait(DEFAULT_WAIT, |e| match e {
+            Event::ProfileRecords {
+                req: r,
+                records,
+                error,
+                ..
+            } if *r == req => Some((records.clone(), error.clone())),
+            _ => None,
+        });
+        assert_eq!(error, None, "reading the profile");
+        records
+    }
+
+    /// Writes records into the browser's profile; returns how many are waiting for the first page
+    /// of their origin.
+    pub fn profile_write(&mut self, id: u32, records: Vec<Record>) -> u32 {
+        let req = self.req();
+        self.send(Command::ProfileWrite {
+            browser: id,
+            req,
+            records,
+        });
+        let (deferred, error) = self.wait(DEFAULT_WAIT, |e| match e {
+            Event::ProfileWritten {
+                req: r,
+                deferred,
+                error,
+                ..
+            } if *r == req => Some((*deferred, error.clone())),
+            _ => None,
+        });
+        assert_eq!(error, None, "writing the profile");
+        deferred
+    }
+
+    pub fn profile_watch(&self, id: u32, on: bool) {
+        self.send(Command::ProfileWatch { browser: id, on });
+    }
+
+    /// A place in the events so far: `changed_since` looks at what comes after it, whatever a
+    /// wait in between has passed over.
+    pub fn mark(&mut self) -> usize {
+        while self.pull(Duration::from_millis(1)) {}
+        self.history.len()
+    }
+
+    /// Waits for a report of changes after `mark` that holds a record `pick` takes; returns all of
+    /// that report's records and its stage.
+    pub fn changed_since(
+        &mut self,
+        mark: usize,
+        within: Duration,
+        pick: impl Fn(&Record) -> bool,
+    ) -> Option<(Vec<Record>, Option<String>)> {
+        let deadline = Instant::now() + within;
+        let mut at = mark;
+        loop {
+            while at < self.history.len() {
+                if let Event::ProfileChanged { records, stage, .. } = &self.history[at]
+                    && records.iter().any(&pick)
+                {
+                    return Some((records.clone(), stage.clone()));
+                }
+                at += 1;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            self.pull(left.min(Duration::from_millis(100)));
+        }
+    }
+
+    /// Copies the IndexedDB folders of the profile in `dir` into a stage.
+    pub fn indexed_db_read(&mut self, dir: &str) -> (Vec<Record>, String) {
+        let req = self.req();
+        self.send(Command::IndexedDbRead {
+            req,
+            dir: dir.into(),
+        });
+        let (records, stage, error) = self.wait(DEFAULT_WAIT, |e| match e {
+            Event::IndexedDbRecords {
+                req: r,
+                records,
+                stage,
+                error,
+            } if *r == req => Some((records.clone(), stage.clone(), error.clone())),
+            _ => None,
+        });
+        assert_eq!(error, None, "reading the folders");
+        (records, stage)
+    }
+
+    /// Puts IndexedDB records from a stage into the profile in `dir`: (written, deferred).
+    pub fn indexed_db_write(&mut self, dir: &str, stage: &str, records: Vec<Record>) -> (u32, u32) {
+        let req = self.req();
+        self.send(Command::IndexedDbWrite {
+            req,
+            dir: dir.into(),
+            stage: stage.into(),
+            records,
+        });
+        let (written, deferred, error) = self.wait(DEFAULT_WAIT, |e| match e {
+            Event::IndexedDbWritten {
+                req: r,
+                written,
+                deferred,
+                error,
+            } if *r == req => Some((*written, *deferred, error.clone())),
+            _ => None,
+        });
+        assert_eq!(error, None, "writing the folders");
+        (written, deferred)
+    }
+
     /// Asks the helper to quit and waits for it; returns the exit code.
     pub fn quit(&mut self) -> Option<i32> {
         let _ = self.commands.send(&Command::Quit);
