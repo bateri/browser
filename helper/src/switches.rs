@@ -116,6 +116,10 @@ pub const PREFS: &[(&str, Pref)] = &[
     // seconds, up to about 7 (measured), before bateri heard the download was done. Off, the
     // system's quarantine mark is still put on a saved file.
     ("safebrowsing.enabled", Pref::Bool(false)),
+    // "Use a web service to resolve network errors": on, a certificate error makes the profile
+    // look for a captive portal (`connectivitycheck.gstatic.com/generate_204`), a request of the
+    // engine's own that went out under the profile's identity.
+    ("alternate_error_pages.enabled", Pref::Bool(false)),
 ];
 
 /// Every switch name used, for a check against the engine's binary (the tests').
@@ -187,5 +191,10 @@ mod tests {
     #[test]
     fn safe_browsing_is_held_off_by_its_preference() {
         assert!(PREFS.contains(&("safebrowsing.enabled", Pref::Bool(false))));
+    }
+
+    #[test]
+    fn no_captive_portal_is_looked_for() {
+        assert!(PREFS.contains(&("alternate_error_pages.enabled", Pref::Bool(false))));
     }
 }

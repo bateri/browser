@@ -2144,15 +2144,15 @@ fn the_engine_makes_no_request_of_its_own() {
             Vec::<String>::new(),
             "round {round}: the engine asked for these itself"
         );
-        let elsewhere: Vec<Seen> = fake
+        // Nor does one go out under a profile's identity: only the page's own address was asked
+        // for with one, `https` (a `CONNECT`) included.
+        let elsewhere: Vec<String> = fake
             .proxy
-            .seen()
+            .identified()
             .into_iter()
-            .filter(|s| s.host != "page.test")
+            .filter(|asked| !asked.starts_with("GET http://page.test/"))
             .collect();
         assert!(elsewhere.is_empty(), "round {round}: {elsewhere:?}");
-        // A clean end of the first round is what makes its profile the engine's own in the
-        // second.
         assert_eq!(fake.quit(), Some(0), "round {round}");
     }
     let _ = std::fs::remove_dir_all(&root);
@@ -3891,6 +3891,17 @@ fn a_certificate_the_engine_does_not_trust_fails_with_its_reason_and_goes_on_whe
         other.error.and_then(|e| e.certificate).as_deref(),
         Some("self-signed")
     );
+    // A certificate error sends the engine nowhere of its own: it used to look for a captive
+    // portal (`connectivitycheck.gstatic.com/generate_204`), under the profile's identity.
+    std::thread::sleep(Duration::from_secs(1));
+    let elsewhere: Vec<String> = fake
+        .proxy
+        .identified()
+        .into_iter()
+        .chain(fake.proxy.strays())
+        .filter(|asked| asked != "CONNECT secure.test:443")
+        .collect();
+    assert!(elsewhere.is_empty(), "{elsewhere:?}");
 }
 
 #[test]

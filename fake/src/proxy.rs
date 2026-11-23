@@ -149,6 +149,21 @@ impl StubProxy {
         self.shared.refused.lock().unwrap().clone()
     }
 
+    /// Every request that carried a profile's identity, as `METHOD target`: a `CONNECT` (an
+    /// `https` address) too, which `seen` leaves out.
+    pub fn identified(&self) -> Vec<String> {
+        let mut all: Vec<String> = self
+            .shared
+            .identified
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        all.sort();
+        all
+    }
+
     /// The refused requests that never came back with a profile's identity: not the first half of
     /// a page's own request (the engine asks the proxy without credentials, hears 407, asks the
     /// browser's profile and sends it again), but one the engine made for itself, which no profile

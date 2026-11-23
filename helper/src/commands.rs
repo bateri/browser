@@ -297,10 +297,10 @@ wrap_request_context_handler! {
 }
 
 /// Holds a request context to the preferences `switches::PREFS` names (WebRTC's UDP only through
-/// the proxy, no DNS prefetching, no Safe Browsing) and reads each back: what counts is the value
-/// in force. The first is also on the command line, which decides it (a preference the command
-/// line decides refuses to be set, and is right); the others are only here. A value that is not in
-/// force is an error of the context, and no browser is opened in it.
+/// the proxy, no DNS prefetching, no Safe Browsing, no captive portal check) and reads each back:
+/// what counts is the value in force. The first is also on the command line, which decides it (a
+/// preference the command line decides refuses to be set, and is right); the others are only here.
+/// A value that is not in force is an error of the context, and no browser is opened in it.
 fn harden(context: &RequestContext) -> Result<(), String> {
     for (name, want) in switches::PREFS {
         let key: CefString = (*name).into();
