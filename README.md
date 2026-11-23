@@ -24,6 +24,9 @@ click, key and command goes the other way over a unix socket.
 - **One way out to the network.** All traffic goes through a loopback proxy bateri runs
   (`--proxy-server` on the engine's command line, loopback not exempt). A profile's proxy identity
   is fixed per profile, so bateri tells profiles apart by it.
+- **No requests of its own.** The engine asks for nothing no page asked for (no update checks, no
+  time from Google, no Safe Browsing checks, which are the warnings about dangerous sites), so the
+  addresses a person visits stay on their machines.
 - **Chromium's cage stays closed.** Renderer and GPU processes run under Chromium's macOS sandbox.
   The engine's own command line is switched off (`command_line_args_disabled`), so `--no-sandbox`
   reaches nothing.

@@ -75,8 +75,10 @@ struct Shared {
     accepted: Mutex<HashSet<(String, String)>>,
     responder: Mutex<Arc<Responder>>,
     seen: Mutex<Vec<Seen>>,
-    /// Requests refused for want of (right) credentials, by method.
+    /// Requests refused for want of (right) credentials, as `METHOD target`.
     refused: Mutex<Vec<String>>,
+    /// Requests that carried a profile's identity, as `METHOD target`.
+    identified: Mutex<HashSet<String>>,
     /// Host names a `CONNECT` is carried through to a local port (a test's own TLS server).
     tunnels: Mutex<HashMap<String, u16>>,
     stop: AtomicBool,
@@ -96,6 +98,7 @@ impl StubProxy {
             responder: Mutex::new(Arc::new(|_| Reply::status(404))),
             seen: Mutex::new(Vec::new()),
             refused: Mutex::new(Vec::new()),
+            identified: Mutex::new(HashSet::new()),
             tunnels: Mutex::new(HashMap::new()),
             stop: AtomicBool::new(false),
         });
@@ -140,9 +143,25 @@ impl StubProxy {
         self.shared.seen.lock().unwrap().clone()
     }
 
-    /// How many requests were turned away with a 407.
+    /// Every request turned away with a 407 (it carried no profile's identity), as
+    /// `METHOD target`.
     pub fn refused(&self) -> Vec<String> {
         self.shared.refused.lock().unwrap().clone()
+    }
+
+    /// The refused requests that never came back with a profile's identity: not the first half of
+    /// a page's own request (the engine asks the proxy without credentials, hears 407, asks the
+    /// browser's profile and sends it again), but one the engine made for itself, which no profile
+    /// answers for.
+    pub fn strays(&self) -> Vec<String> {
+        let identified = self.shared.identified.lock().unwrap().clone();
+        let mut strays: Vec<String> = self
+            .refused()
+            .into_iter()
+            .filter(|r| !identified.contains(r))
+            .collect();
+        strays.dedup();
+        strays
     }
 
     pub fn url(&self) -> String {
@@ -217,14 +236,16 @@ fn serve(stream: TcpStream, shared: Arc<Shared>) {
             })
             .filter(|cred| shared.accepted.lock().unwrap().contains(cred))
             .map(|(u, _)| u);
+        let asked = format!("{method} {target}");
         let Some(user) = user else {
-            shared.refused.lock().unwrap().push(method.clone());
+            shared.refused.lock().unwrap().push(asked);
             let reply = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"stub\"\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
             if out.write_all(reply).is_err() {
                 return;
             }
             continue;
         };
+        shared.identified.lock().unwrap().insert(asked);
         if method == "CONNECT" {
             let host = target.rsplit_once(':').map_or(target.as_str(), |(h, _)| h);
             let port = shared.tunnels.lock().unwrap().get(host).copied();

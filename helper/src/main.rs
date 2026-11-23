@@ -46,6 +46,8 @@ wrap_app! {
     struct HelperApp {
         proxy_port: u16,
         mock_keychain: bool,
+        // The file `switches::MODEL_MANIFEST` names.
+        model_manifest: String,
     }
 
     impl App {
@@ -66,8 +68,9 @@ wrap_app! {
                 cl.append_switch(Some(&switches::MOCK_KEYCHAIN.into()));
             }
             // Nothing leaves this process except through the proxy: no background services, no
-            // QUIC (UDP), no host name resolved here, no WebRTC UDP outside the proxy
-            // (`switches` names each one and the end-to-end suite looks them up in the engine).
+            // QUIC (UDP), no host name resolved here, no WebRTC UDP outside the proxy, and none of
+            // the engine's own requests (`switches` names each one and the end-to-end suite looks
+            // them up in the engine).
             for switch in switches::PLAIN {
                 cl.append_switch(Some(&(*switch).into()));
             }
@@ -77,6 +80,10 @@ wrap_app! {
             cl.append_switch_with_value(
                 Some(&"disable-features".into()),
                 Some(&switches::disabled_features().as_str().into()),
+            );
+            cl.append_switch_with_value(
+                Some(&switches::MODEL_MANIFEST.into()),
+                Some(&self.model_manifest.as_str().into()),
             );
         }
 
@@ -155,8 +162,18 @@ fn main() {
     with(|s| s.root = root.clone());
     sync::clear_stages(&root);
 
+    // The engine takes the switch, not the file, as the sign to leave its component updater out of
+    // the on-device model: a file it cannot read costs a line in its log and nothing else.
+    let (name, empty) = switches::MODEL_MANIFEST_FILE;
+    let model_manifest = root.join(name);
+    let _ = std::fs::write(&model_manifest, empty);
+
     let args = Args::new();
-    let mut app = HelperApp::new(cfg.proxy_port, cfg.mock_keychain);
+    let mut app = HelperApp::new(
+        cfg.proxy_port,
+        cfg.mock_keychain,
+        model_manifest.to_string_lossy().into_owned(),
+    );
     let ret = execute_process(
         Some(args.as_main_args()),
         Some(&mut app),

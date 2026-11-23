@@ -547,6 +547,8 @@ mod tests {
             assert!(!profile_dir_ok(bad), "{bad:?}");
         }
         assert!(!profile_dir_ok(&"a".repeat(65)));
+        // The helper's own file in the profiles' folder is never a profile's.
+        assert!(!profile_dir_ok(crate::switches::MODEL_MANIFEST_FILE.0));
     }
 
     #[test]

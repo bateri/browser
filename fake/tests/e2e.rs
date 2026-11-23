@@ -2028,11 +2028,13 @@ fn every_switch_and_preference_the_helper_names_is_one_the_engine_has() {
         missing.is_empty(),
         "the engine has no preference {missing:?}"
     );
-    // A feature's name is looked up as text only (the engine keeps some inside longer strings).
+    // A feature's name is kept as its identifier, `kName` between two NULs (Chromium's
+    // `BASE_FEATURE(kName, ...)` takes the name from it). Looked up as plain text the check could
+    // not fail: `SafeBrowsing` and `Translate`, which are no features, are words the engine has.
     let missing: Vec<&str> = switches::DISABLED_FEATURES
         .iter()
         .copied()
-        .filter(|f| !contains_bytes(&engine, f.as_bytes()))
+        .filter(|f| !exact(&format!("k{f}")))
         .collect();
     assert!(missing.is_empty(), "the engine has no feature {missing:?}");
     // And the policy the engine takes by name.
@@ -2111,6 +2113,49 @@ fn the_network_process_is_told_to_resolve_no_name_but_the_proxys() {
             "process {pid} has no resolver rule: {command}"
         );
     }
+}
+
+/// How long the engine is watched for requests of its own after a page has loaded. The last of
+/// the ones it used to make came 2.5 seconds after its start; a three-minute watch found none
+/// later.
+const OWN_REQUESTS_WAIT: u64 = 8;
+
+#[test]
+#[ignore]
+fn the_engine_makes_no_request_of_its_own() {
+    // Every request a page makes carries its profile's identity; one the engine makes for itself
+    // (the time, a component update, AI Mode's eligibility, the translate ranker's model) carries
+    // none, and bateri's proxy turns it away. It must not be made at all. Twice on the same
+    // folder: the second start loads the profile used last as the engine's own.
+    let root = scratch("own-requests");
+    for round in 0..2 {
+        let mut fake = Fake::start_with(Options {
+            root: Some(root.clone()),
+            ..Default::default()
+        });
+        serve(&fake, "<title>t</title><body>a page</body>");
+        fake.open(1, profile("a", Some("pa")), 300, 200, 1.0);
+        fake.open(2, profile("b", None), 300, 200, 1.0);
+        fake.go(1, "http://page.test/");
+        fake.go(2, "http://page.test/");
+        std::thread::sleep(Duration::from_secs(OWN_REQUESTS_WAIT));
+        assert_eq!(
+            fake.proxy.strays(),
+            Vec::<String>::new(),
+            "round {round}: the engine asked for these itself"
+        );
+        let elsewhere: Vec<Seen> = fake
+            .proxy
+            .seen()
+            .into_iter()
+            .filter(|s| s.host != "page.test")
+            .collect();
+        assert!(elsewhere.is_empty(), "round {round}: {elsewhere:?}");
+        // A clean end of the first round is what makes its profile the engine's own in the
+        // second.
+        assert_eq!(fake.quit(), Some(0), "round {round}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 // ---- the developer tools window ----

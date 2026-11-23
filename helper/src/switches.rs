@@ -29,17 +29,36 @@ pub const PLAIN: &[&str] = &[
     "disable-domain-reliability",
 ];
 
-/// Features turned off (`disable-features`). The macOS notification bridge starts a helper of its
-/// own that registers the app with the system's notification center, which makes the system ask
-/// the person whether "bateri Browser" may send notifications; the helper never shows any (a
-/// page's request is refused), so it must not appear there at all.
+/// Features turned off (`disable-features`). A name is the feature's own, without the `k` of its
+/// identifier in Chromium's source; the end-to-end suite finds each one in the engine as that
+/// identifier, which is how a feature's name is kept there.
+///
+/// The engine's own requests that no page made, each turned off where it starts. They carry no
+/// profile's identity, so bateri's proxy refuses them (407), but they must not be made at all;
+/// the end-to-end suite (`the_engine_makes_no_request_of_its_own`) is what shows a feature is in
+/// force, since the engine has no way to read one back.
 pub const DISABLED_FEATURES: &[&str] = &[
     "OptimizationHints",
-    "Translate",
     "MediaRouter",
     "AutofillServerCommunication",
-    "SafeBrowsing",
+    // The macOS notification bridge starts a helper of its own that registers the app with the
+    // system's notification center, which makes the system ask the person whether "bateri
+    // Browser" may send notifications; the helper never shows any (a page's request is refused),
+    // so it must not appear there at all.
     "NativeNotifications",
+    // The time from Google (`clients2.google.com/time/1/current`), asked for at the start and
+    // every few minutes. Its preference (`network_time.network_time_queries_enabled`, the
+    // `BrowserNetworkTimeQueriesEnabled` policy) is the browser's and not a profile's, and the
+    // engine reads it before the helper could set it: the first query goes out at the start.
+    "NetworkTimeServiceQuerying",
+    // AI Mode's eligibility (`www.google.com/async/folae`), asked for by every profile at its
+    // start, with that profile's Google cookies. No preference stops it: the `AIModeSettings`
+    // policy only leaves the answer unused.
+    "AimEnabled",
+    // The translate ranker's model (`www.gstatic.com/.../translate_ranker_model_*.pb.bin`),
+    // fetched when the first page opens. With both off the ranker has no model to load.
+    "TranslateRankerQuery",
+    "TranslateRankerEnforcement",
 ];
 
 /// The host-resolver rule: no name is resolved by this process, only the proxy's own address (an
@@ -47,8 +66,8 @@ pub const DISABLED_FEATURES: &[&str] = &[
 /// names and are resolved where the proxy runs.
 pub const HOST_RESOLVER_RULES: &str = "MAP * ~NOTFOUND , EXCLUDE 127.0.0.1";
 
-/// Switches with a value, besides `proxy-server` (its port is the launch's) and
-/// `disable-features` (`DISABLED_FEATURES`).
+/// Switches with a value, besides `proxy-server` (its port is the launch's),
+/// `disable-features` (`DISABLED_FEATURES`) and `MODEL_MANIFEST` (a path in the profiles' folder).
 pub const VALUED: &[(&str, &str)] = &[
     // `<-loopback>`: `localhost` goes through the proxy too.
     ("proxy-bypass-list", "<-loopback>"),
@@ -58,6 +77,18 @@ pub const VALUED: &[(&str, &str)] = &[
 ];
 
 pub const WEBRTC_POLICY: &str = "disable_non_proxied_udp";
+
+/// Where the on-device model's manifest is read from, instead of the component updater. At every
+/// start the engine registers that manifest with its component updater and asks for it at once
+/// (`update.googleapis.com/service/update2/json`), `disable-component-update` or not: no
+/// preference or feature stops it. Given a file, the engine reads the manifest from there and
+/// never asks the updater; the helper's file holds nothing (`MODEL_MANIFEST_FILE`), so there is no
+/// manifest and no model to fetch.
+pub const MODEL_MANIFEST: &str = "optimization-guide-manifest-override";
+
+/// The file `MODEL_MANIFEST` names, in the profiles' folder (a profile's folder cannot start with
+/// a dot), and what it holds: no manifest and no components.
+pub const MODEL_MANIFEST_FILE: (&str, &str) = (".no-model-manifest.json", "{}");
 
 /// What a preference is set to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,17 +110,23 @@ pub const PREFS: &[(&str, Pref)] = &[
         "net.network_prediction_options",
         Pref::Int(NETWORK_PREDICTION_DISABLED),
     ),
-    // Safe Browsing, which `SafeBrowsing` in `DISABLED_FEATURES` does not turn off: on, it holds
-    // every finished download back while a utility process looks into the file and a report goes
-    // to Google, which the proxy turns away (it carries no profile's identity). On a busy machine
-    // that took seconds, up to about 7 (measured), before bateri heard the download was done.
+    // Safe Browsing (there is no feature of that name to turn it off): on, it holds every finished
+    // download back while a utility process looks into the file and a report goes to Google,
+    // which the proxy turns away (it carries no profile's identity). On a busy machine that took
+    // seconds, up to about 7 (measured), before bateri heard the download was done. Off, the
+    // system's quarantine mark is still put on a saved file.
     ("safebrowsing.enabled", Pref::Bool(false)),
 ];
 
 /// Every switch name used, for a check against the engine's binary (the tests').
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn names() -> Vec<&'static str> {
-    let mut all = vec![PROXY_SERVER, MOCK_KEYCHAIN, "disable-features"];
+    let mut all = vec![
+        PROXY_SERVER,
+        MOCK_KEYCHAIN,
+        "disable-features",
+        MODEL_MANIFEST,
+    ];
     all.extend(PLAIN);
     all.extend(VALUED.iter().map(|(name, _)| *name));
     all
@@ -112,6 +149,14 @@ mod tests {
             "force-webrtc-ip-handling-policy",
         ] {
             assert!(!names().contains(&dead), "{dead}");
+        }
+    }
+
+    #[test]
+    fn the_known_dead_features_are_gone() {
+        // Not features of this engine: nothing of either was ever turned off by them.
+        for dead in ["SafeBrowsing", "Translate"] {
+            assert!(!DISABLED_FEATURES.contains(&dead), "{dead}");
         }
     }
 
