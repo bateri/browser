@@ -297,8 +297,9 @@ fn main() {
     // start of its teardown (then exits with 2, its "hung" code, after "Teardown watchdog expired"
     // in the log) and inside them waits up to 10 seconds for its network process to exit. On a
     // machine busy enough to starve that process's background writes, the second outlasts the
-    // first. The cookies were written above, and a site's storage by its own process, so such an
-    // end loses nothing a profile keeps.
+    // first. After such an end the next start still found a site's cookies (written above), Local
+    // Storage, IndexedDB, service worker and Cache Storage; the profile's preferences and the
+    // engine's own state were not checked.
     shutdown();
 }
 
