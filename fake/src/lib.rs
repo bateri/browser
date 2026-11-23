@@ -566,10 +566,17 @@ impl Fake {
         (written, deferred)
     }
 
-    /// Asks the helper to quit and waits for it; returns the exit code.
+    /// Asks the helper to quit and waits for it; returns the exit code. Any other end than 0 puts
+    /// the helper's last lines in the test's output: an exit of 2 with "Teardown watchdog
+    /// expired" is the engine giving up on its own shutdown (on a machine too busy to let its
+    /// network process finish in 10 seconds), not the helper's.
     pub fn quit(&mut self) -> Option<i32> {
         let _ = self.commands.send(&Command::Quit);
-        self.reap(Duration::from_secs(15))
+        let code = self.reap(Duration::from_secs(15));
+        if code != Some(0) {
+            eprintln!("the helper ended with {code:?}; its log:\n{}", self.log());
+        }
+        code
     }
 
     /// Stops (or resumes) taking frames off the port: a receiver that is behind.

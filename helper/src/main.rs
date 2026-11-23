@@ -293,6 +293,12 @@ fn main() {
         do_message_loop_work();
     }
     state::flush_output(Duration::from_secs(2));
+    // The engine's own end, which the helper cannot bound: it gives itself 10 seconds from the
+    // start of its teardown (then exits with 2, its "hung" code, after "Teardown watchdog expired"
+    // in the log) and inside them waits up to 10 seconds for its network process to exit. On a
+    // machine busy enough to starve that process's background writes, the second outlasts the
+    // first. The cookies were written above, and a site's storage by its own process, so such an
+    // end loses nothing a profile keeps.
     shutdown();
 }
 
