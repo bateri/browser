@@ -3614,6 +3614,45 @@ fn a_named_profile_keeps_its_session_cookies_when_the_helper_ends_and_starts_aga
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// bateri ends a helper that has not quit within its wait. The cookies are on the disk by then:
+/// a quit cut 30 ms in (long before any wait, on a machine at rest or saturated) loses neither the
+/// cookie of the session nor the lasting one.
+#[test]
+#[ignore]
+fn a_quit_cut_short_keeps_the_cookies_of_the_session_and_the_lasting_ones() {
+    let root = scratch("quit-cut-short");
+    {
+        let mut fake = Fake::start_with(Options {
+            root: Some(root.clone()),
+            ..Default::default()
+        });
+        fake.proxy.respond(profile_site);
+        fake.open(1, profile("a", Some("pa")), 200, 100, 1.0);
+        fake.go(1, "http://site.test/set");
+        fake.go(1, "http://site.test/");
+        assert_eq!(
+            fake.quit_within(Duration::from_millis(30)),
+            None,
+            "killed, not quit"
+        );
+    }
+    let mut fake = Fake::start_with(Options {
+        root: Some(root.clone()),
+        ..Default::default()
+    });
+    fake.proxy.respond(profile_site);
+    fake.open(1, profile("a", Some("pa")), 200, 100, 1.0);
+    let records = fake.profile_read(1);
+    assert!(cookie_named(&records, "sid").is_some(), "{records:?}");
+    assert_eq!(
+        cookie_named(&records, "tmp").map(|c| c.value.as_str()),
+        Some("2"),
+        "the session cookie is gone after a quit cut short: {records:?}"
+    );
+    assert_eq!(fake.quit(), Some(0));
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 #[ignore]
 fn a_session_cookie_is_kept_also_when_its_profile_is_the_one_the_engine_last_used() {

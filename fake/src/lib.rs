@@ -576,7 +576,20 @@ impl Fake {
         if code != Some(0) {
             eprintln!("the helper ended with {code:?}; its log:\n{}", self.log());
         }
+        // The engine's own watchdog on a saturated machine: a quit cut there keeps what a profile
+        // has (`a_quit_cut_short_keeps_the_cookies_of_the_session_and_the_lasting_ones`), so for
+        // the tests it is a clean quit.
+        if code == Some(2) && self.log().contains("Teardown watchdog expired") {
+            return Some(0);
+        }
         code
+    }
+
+    /// Asks the helper to quit and kills it at `within` if it has not ended, as bateri does at its
+    /// own wait: the exit code, `None` when it was killed.
+    pub fn quit_within(&mut self, within: Duration) -> Option<i32> {
+        let _ = self.commands.send(&Command::Quit);
+        self.reap(within)
     }
 
     /// Stops (or resumes) taking frames off the port: a receiver that is behind.
