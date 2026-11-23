@@ -2318,6 +2318,61 @@ fn progress_of(e: &Event, want: u32) -> Option<DownloadState> {
     }
 }
 
+/// The value of the extended attribute `name` of the file at `path`, if it has one.
+fn xattr(path: &std::path::Path, name: &str) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let name = std::ffi::CString::new(name).ok()?;
+    let mut value = vec![0u8; 1024];
+    // SAFETY: both names are NUL-terminated and `value` is writable for its length.
+    let n = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    (n >= 0).then(|| {
+        value.truncate(n as usize);
+        value
+    })
+}
+
+#[test]
+#[ignore]
+fn a_saved_download_carries_the_systems_mark_of_a_file_from_the_internet() {
+    // Safe Browsing is off (`safebrowsing.enabled`), which is not what puts the mark on: the system
+    // asks before a file with it is opened, whatever the browser checked.
+    let mut fake = Fake::start();
+    fake.proxy.respond(|_| download_reply(b"0123456789"));
+    let dir = scratch("dl-mark");
+    fake.open(1, profile("a", None), 200, 100, 1.0);
+    fake.send(Command::Navigate {
+        browser: 1,
+        url: "http://dl.test/f.bin".into(),
+    });
+    let req = fake.wait(SHORT, |e| match e {
+        Event::Download { req, .. } => Some(*req),
+        _ => None,
+    });
+    let dest = dir.join("marked.bin");
+    fake.send(Command::DownloadResult {
+        req,
+        path: Some(dest.to_string_lossy().into_owned()),
+    });
+    fake.wait(Duration::from_secs(10), |e| {
+        (progress_of(e, req) == Some(DownloadState::Done)).then_some(())
+    });
+    assert_eq!(std::fs::read(&dest).unwrap(), b"0123456789");
+    wait_until("the quarantine mark on the saved file", || {
+        xattr(&dest, "com.apple.quarantine").is_some()
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 #[ignore]
 fn a_download_that_breaks_off_is_over_and_says_so() {
