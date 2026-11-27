@@ -225,20 +225,17 @@ impl Launch {
     ///
     /// `root` is where profiles live and `proxy` the loopback proxy (`http://127.0.0.1:PORT`)
     /// every request of the helper goes through. The helper does not start without any of the
-    /// five. `mock_keychain` keeps cookie encryption off the user's keychain (tests and
-    /// development builds).
-    pub fn args(&self, root: &Path, proxy: &str, mock_keychain: bool) -> Vec<String> {
-        let mut args = vec![
+    /// five. It always carries `--mock-keychain`: engine 0.1.0 reads it to keep cookie encryption
+    /// off the person's keychain, and newer engines use no keychain whatever it says.
+    pub fn args(&self, root: &Path, proxy: &str) -> Vec<String> {
+        vec![
             format!("--key={}", self.key),
             format!("--socket={}", self.socket.display()),
             format!("--mach={}", self.mach),
             format!("--root={}", root.display()),
             format!("--proxy={proxy}"),
-        ];
-        if mock_keychain {
-            args.push("--mock-keychain".into());
-        }
-        args
+            "--mock-keychain".into(),
+        ]
     }
 
     /// The bootstrap name the frames are received under; register it (`mach::Receiver`) before

@@ -16,7 +16,6 @@ pub struct Config {
     pub root: PathBuf,
     /// The port of bateri's proxy on 127.0.0.1.
     pub proxy_port: u16,
-    pub mock_keychain: bool,
 }
 
 /// What a missing or wrong argument looks like to the person who started the helper by hand.
@@ -51,7 +50,6 @@ pub fn parse_proxy(value: &str) -> Result<u16, String> {
 
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Config, ConfigError> {
     let (mut key, mut socket, mut mach, mut root, mut proxy) = (None, None, None, None, None);
-    let mut mock_keychain = false;
     for arg in args {
         let Some(flag) = arg.strip_prefix("--") else {
             continue;
@@ -66,7 +64,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Config, ConfigErr
             ("mach", v) => mach = v,
             ("root", v) => root = v,
             ("proxy", v) => proxy = v,
-            ("mock-keychain", None) => mock_keychain = true,
+            // Anything else is ignored, `--mock-keychain` included: bateri sends it so that
+            // engine 0.1.0, which reads it, keeps off the keychain too; this engine never uses
+            // the keychain whatever the line says.
             _ => {}
         }
     }
@@ -82,7 +82,6 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Config, ConfigErr
         mach,
         root: root.into(),
         proxy_port,
-        mock_keychain,
     })
 }
 
@@ -106,10 +105,10 @@ mod tests {
     fn all_five_values_make_a_config() {
         let config = parse(args(&FULL)).unwrap();
         assert_eq!(config.proxy_port, 9000);
-        assert!(!config.mock_keychain);
+        // The switch of engine 0.1.0 is accepted and changes nothing.
         let mut more = args(&FULL);
         more.push("--mock-keychain".into());
-        assert!(parse(more).unwrap().mock_keychain);
+        assert_eq!(parse(more).unwrap().proxy_port, 9000);
     }
 
     #[test]

@@ -119,7 +119,7 @@ impl Fake {
         let root = options.root.clone().unwrap_or_else(|| dir.join("root"));
         let launch = Launch::prepare(&dir.join("sock")).expect("prepare the launch");
         let receiver = Receiver::register(launch.mach_name()).expect("register the mach name");
-        let mut args = launch.args(&root, &proxy.url(), true);
+        let mut args = launch.args(&root, &proxy.url());
         args.extend(options.extra_args.clone());
         let log = std::fs::File::create(dir.join("helper.log")).expect("log file");
         let child = std::process::Command::new(app_executable())

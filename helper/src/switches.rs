@@ -10,11 +10,12 @@
 /// The proxy: every request, loopback included (a page on localhost is bateri's to see too).
 pub const PROXY_SERVER: &str = "proxy-server";
 
-/// Only for tests and development: the keychain is not the user's.
-pub const MOCK_KEYCHAIN: &str = "use-mock-keychain";
-
 /// Switches that take no value.
 pub const PLAIN: &[&str] = &[
+    // The engine never uses the person's keychain: Chromium's stand-in gives it a fixed key, so the
+    // cookies on disk are as open as the rest of the profile. The login keychain's "Safe Storage"
+    // item can belong to another app, and macOS then asks the person's password for it.
+    "use-mock-keychain",
     // Without this the engine hands a proxy's 407 to Chrome's own login prompt, which an
     // off-screen browser does not have, and `auth_credentials` is never called.
     "disable-chrome-login-prompt",
@@ -125,12 +126,7 @@ pub const PREFS: &[(&str, Pref)] = &[
 /// Every switch name used, for a check against the engine's binary (the tests').
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn names() -> Vec<&'static str> {
-    let mut all = vec![
-        PROXY_SERVER,
-        MOCK_KEYCHAIN,
-        "disable-features",
-        MODEL_MANIFEST,
-    ];
+    let mut all = vec![PROXY_SERVER, "disable-features", MODEL_MANIFEST];
     all.extend(PLAIN);
     all.extend(VALUED.iter().map(|(name, _)| *name));
     all

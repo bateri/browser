@@ -45,7 +45,6 @@ const SHUTDOWN_LIMIT: Duration = Duration::from_secs(8);
 wrap_app! {
     struct HelperApp {
         proxy_port: u16,
-        mock_keychain: bool,
         // The file `switches::MODEL_MANIFEST` names.
         model_manifest: String,
     }
@@ -64,9 +63,6 @@ wrap_app! {
                 Some(&switches::PROXY_SERVER.into()),
                 Some(&proxy.as_str().into()),
             );
-            if self.mock_keychain {
-                cl.append_switch(Some(&switches::MOCK_KEYCHAIN.into()));
-            }
             // Nothing leaves this process except through the proxy: no background services, no
             // QUIC (UDP), no host name resolved here, no WebRTC UDP outside the proxy, and none of
             // the engine's own requests (`switches` names each one and the end-to-end suite looks
@@ -171,7 +167,6 @@ fn main() {
     let args = Args::new();
     let mut app = HelperApp::new(
         cfg.proxy_port,
-        cfg.mock_keychain,
         model_manifest.to_string_lossy().into_owned(),
     );
     let ret = execute_process(
